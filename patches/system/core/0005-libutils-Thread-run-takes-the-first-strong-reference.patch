@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 19:52:30 +0300
+Subject: [PATCH] libutils: Thread::run takes the first strong reference for
+ vendor code
+
+Since Android 12 run() uses sp<Thread>::fromExisting(this), which aborts
+when the Thread is not owned by an sp<> yet. Legacy vendor blobs create
+threads with a raw new and run them immediately: the Nougat MediaTek camera
+HAL on the Meizu MX6 (P2Procedure::createProcessor, libmtkcam_hwnode.so)
+aborted the camera provider with 'incStrongRequireStrong() called on ...
+which isn't already owned' on every configureStreams, so the camera opened
+without a preview. In the VNDK variant, take the reference as run() did
+before (force_set); the system variant keeps the strict check.
+
+Change-Id: I1f56f9f9e94d21cd523a7d18179c57e0b6fdf2be
+
+diff --git a/libutils/Threads.cpp b/libutils/Threads.cpp
+index e756fec..f1e34e2 100644
+--- a/libutils/Threads.cpp
++++ b/libutils/Threads.cpp
+@@ -673,7 +673,19 @@ status_t Thread::run(const char* name, int32_t priority, size_t stack)
+     mThread = thread_id_t(-1);
+ 
+     // hold a strong reference on ourself
++#if defined(__ANDROID_VNDK__)
++    // Legacy vendor code creates a Thread with a raw new and calls run() before
++    // any sp<> owns it (Meizu MX6: the Nougat MediaTek camera HAL,
++    // P2Procedure::createProcessor in libmtkcam_hwnode.so), which fromExisting()
++    // turns into "incStrongRequireStrong() called on ... which isn't already
++    // owned" and an abort of the camera provider. The vendor (VNDK) variant takes
++    // the reference the way run() did before Android 12; the system variant keeps
++    // the strict check.
++    mHoldSelf.clear();
++    mHoldSelf.force_set(this);
++#else
+     mHoldSelf = sp<Thread>::fromExisting(this);
++#endif
+ 
+     mRunning = true;
+ 

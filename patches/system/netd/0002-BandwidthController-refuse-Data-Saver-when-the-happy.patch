@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 14:36:14 +0300
+Subject: [PATCH] BandwidthController: refuse Data Saver when the happy box is
+ missing
+
+On kernels without xt_bpf revision 1 enableBandwidthControl() leaves the
+allowlist rule out of bw_happy_box. Nothing then RETURNs before
+bw_data_saver, so turning Data Saver on would REJECT every packet on
+metered interfaces, system apps included.
+
+Report failure instead. NetworkManagementService passes it on and
+NetworkPolicyManagerService reverts mRestrictBackground without persisting
+it, so Data Saver stays off. Turning it off is unaffected, as is every
+kernel that has revision 1.
+
+Test: BandwidthControllerTest updated; netd_unit_test was not run.
+
+Change-Id: I0a616f34afdb01f61ef903cef84dc9884b043ace
+
+diff --git a/server/BandwidthController.cpp b/server/BandwidthController.cpp
+index c70189c..2301461 100644
+--- a/server/BandwidthController.cpp
++++ b/server/BandwidthController.cpp
+@@ -355,6 +355,15 @@ std::string BandwidthController::makeDataSaverCommand(IptablesTarget target, boo
+ }
+ 
+ int BandwidthController::enableDataSaver(bool enable) {
++    if (enable && !kernelHasXtBpfPinnedFunction()) {
++        // enableBandwidthControl() left the allowlist rule out of bw_happy_box on this kernel, so
++        // nothing would RETURN before the REJECT in bw_data_saver: every app, system ones
++        // included, would lose metered networks. Refuse; NetworkPolicyManagerService then keeps
++        // Data Saver off.
++        ALOGE("Not enabling data saver: kernel lacks xt_bpf revision 1, happy box is empty");
++        return -EOPNOTSUPP;
++    }
++
+     int ret = iptablesRestoreFunction(V4, makeDataSaverCommand(V4, enable), nullptr);
+     ret |= iptablesRestoreFunction(V6, makeDataSaverCommand(V6, enable), nullptr);
+     return ret;
+diff --git a/server/BandwidthControllerTest.cpp b/server/BandwidthControllerTest.cpp
+index 4764395..141397b 100644
+--- a/server/BandwidthControllerTest.cpp
++++ b/server/BandwidthControllerTest.cpp
+@@ -303,6 +303,25 @@ TEST_F(BandwidthControllerTest, TestEnableDataSaver) {
+     });
+ }
+ 
++TEST_F(BandwidthControllerTest, TestEnableDataSaverWithoutXtBpfPinned) {
++    simulateKernelWithoutXtBpfPinned();
++
++    // No happy box, so enforcing data saver would reject every app on metered networks.
++    EXPECT_EQ(-EOPNOTSUPP, mBw.enableDataSaver(true));
++    expectIptablesRestoreCommands(ExpectedIptablesCommands{});
++
++    EXPECT_EQ(0, mBw.enableDataSaver(false));
++    std::string expected = {
++            "*filter\n"
++            ":bw_data_saver -\n"
++            "-A bw_data_saver -j RETURN\n"
++            "COMMIT\n"};
++    expectIptablesRestoreCommands({
++        {V4, expected},
++        {V6, expected},
++    });
++}
++
+ const std::vector<std::string> makeInterfaceQuotaCommands(const std::string& iface, int ruleIndex,
+                                                           int64_t quota) {
+     const std::string chain = "bw_costly_" + iface;

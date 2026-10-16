@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 17:15:51 +0300
+Subject: [PATCH] gnss: 1.0 default: copy NMEA sentences instead of
+ setToExternal()
+
+The Nougat MediaTek GNSS HAL (gps.mt6797.so) passes NMEA sentences without
+a NUL at data[length]. Since Android 10 hidl_string::setToExternal() does
+CHECK(data[size] == '\0'), so android.hardware.gnss@1.0-service aborted
+every ~1.5 s ('Check failed: data[size] == '\0'', in Gnss::nmeaCb called
+from the HAL). Copy the short string once per sentence instead.
+
+Change-Id: Ibbc5bc181935920c18bd69a5919958c66358bc84
+
+diff --git a/gnss/1.0/default/Gnss.cpp b/gnss/1.0/default/Gnss.cpp
+index 7d1cacf..1ccace6 100644
+--- a/gnss/1.0/default/Gnss.cpp
++++ b/gnss/1.0/default/Gnss.cpp
+@@ -260,8 +260,15 @@ void Gnss::nmeaCb(GpsUtcTime timestamp, const char* nmea, int length) {
+         return;
+     }
+ 
+-    android::hardware::hidl_string nmeaString;
+-    nmeaString.setToExternal(nmea, length);
++    // MediaTek gps.mt6797.so (Nougat) passes NMEA without a NUL at [length];
++    // since Android 10 hidl_string::setToExternal CHECKs data[size] == '\0'
++    // and aborted the HAL every ~1.5 s (m95 LOS20 #18, tombstones 34-47).
++    // Copy instead -- the port of 18.1 fb6e82d.
++    if (nmea == nullptr || length < 0) {
++        ALOGE("%s: invalid NMEA buffer", __func__);
++        return;
++    }
++    android::hardware::hidl_string nmeaString(std::string(nmea, length));
+     auto ret = sGnssCbIface->gnssNmeaCb(timestamp, nmeaString);
+     if (!ret.isOk()) {
+         ALOGE("%s: Unable to invoke callback", __func__);

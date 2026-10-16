@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:36:48 +0300
+Subject: [PATCH] camera: add a vendor copy of libcamera_client for legacy
+ camera HALs
+
+Legacy vendor camera HALs (Meizu MX6: the Nougat MediaTek HAL1 stack, 21
+libraries in /vendor/lib{,64}) need libcamera_client.so, which Android 13
+only builds for /system; the camera provider then fails to link and there
+are no cameras. Move the module body into libcamera_client_defaults and add
+libcamera_client_vendor (stem libcamera_client, vendor: true) linked
+against libgui_vendor. lib-platform-compat-native-api is system-only, so
+its AIDL client is compiled into the vendor copy. media/hardware/HardwareAPI.h
+reaches the system copy through libgui's exported headers, which
+libgui_vendor does not export, so the vendor copy also needs
+media_plugin_headers.
+
+VendorLegacyCompat.cpp, vendor copy only, restores two entry points the
+Nougat blobs import: CameraBase<Camera>::getCameraInfo(int, CameraInfo*)
+(before overrideToPortrait) and Camera::connectLegacy (removed in Android
+10; returns INVALID_OPERATION, used only by video-telephony libraries).
+
+Change-Id: Ia1f5b99b876e9a0f0d95a28acd1da448be500748
+
+diff --git a/camera/Android.bp b/camera/Android.bp
+index 3e28e4f..90bc7b2 100644
+--- a/camera/Android.bp
++++ b/camera/Android.bp
+@@ -47,8 +47,9 @@ cc_library_headers {
+     name: "camera_headers",
+     export_include_dirs: ["include"],
+ }
+-cc_library_shared {
+-    name: "libcamera_client",
++// Shared by the system libcamera_client and the vendor copy below.
++cc_defaults {
++    name: "libcamera_client_defaults",
+ 
+     aidl: {
+         export_aidl_headers: true,
+@@ -90,10 +91,8 @@ cc_library_shared {
+         "libutils",
+         "liblog",
+         "libbinder",
+-        "libgui",
+         "libcamera_metadata",
+         "libnativewindow",
+-        "lib-platform-compat-native-api",
+     ],
+ 
+     include_dirs: [
+@@ -104,7 +103,7 @@ cc_library_shared {
+          "include",
+          "include/camera"
+     ],
+-    export_shared_lib_headers: ["libcamera_metadata", "libnativewindow", "libgui"],
++    export_shared_lib_headers: ["libcamera_metadata", "libnativewindow"],
+ 
+     cflags: [
+         "-Werror",
+@@ -114,6 +113,41 @@ cc_library_shared {
+ 
+ }
+ 
++cc_library_shared {
++    name: "libcamera_client",
++    defaults: ["libcamera_client_defaults"],
++    shared_libs: [
++        "libgui",
++        "lib-platform-compat-native-api",
++    ],
++    export_shared_lib_headers: ["libgui"],
++}
++
++// Vendor copy for legacy camera HALs whose blobs NEED libcamera_client.so
++// (Meizu MX6: the Nougat MediaTek HAL1 stack, 21 libraries). Same sources,
++// linked against libgui_vendor; the platform-compat AIDL client is compiled in
++// because lib-platform-compat-native-api is system-only.
++// VendorLegacyCompat.cpp restores the two entry points those blobs import
++// that Android 13 changed or removed.
++cc_library_shared {
++    name: "libcamera_client_vendor",
++    stem: "libcamera_client",
++    vendor: true,
++    defaults: ["libcamera_client_defaults"],
++    srcs: [
++        ":platform-compat-native-aidl",
++        "VendorLegacyCompat.cpp",
++    ],
++    aidl: {
++        include_dirs: ["frameworks/base/native/android/aidl"],
++    },
++    shared_libs: ["libgui_vendor"],
++    export_shared_lib_headers: ["libgui_vendor"],
++    // media/hardware/HardwareAPI.h: the system copy gets it transitively
++    // through libgui's exported headers, libgui_vendor does not export it.
++    header_libs: ["media_plugin_headers"],
++}
++
+ cc_library_host_static {
+     name: "libcamera_client_host",
+ 
+diff --git a/camera/VendorLegacyCompat.cpp b/camera/VendorLegacyCompat.cpp
+new file mode 100644
+index 0000000..6f36158
+--- /dev/null
++++ b/camera/VendorLegacyCompat.cpp
+@@ -0,0 +1,35 @@
++/*
++ * Entry points that legacy (Nougat) vendor camera HALs import from
++ * libcamera_client and that Android 13 changed or removed. Built only into the
++ * vendor copy, libcamera_client_vendor (stem libcamera_client).
++ */
++
++#include <camera/Camera.h>
++#include <camera/CameraBase.h>
++
++using android::Camera;
++using android::CameraBase;
++using android::sp;
++using android::status_t;
++using android::String16;
++
++extern "C" {
++
++// static status_t CameraBase<Camera>::getCameraInfo(int, hardware::CameraInfo*):
++// the pre-Android 13 signature, before overrideToPortrait was added.
++status_t _ZN7android10CameraBaseINS_6CameraENS_12CameraTraitsIS1_EEE13getCameraInfoEiPNS_8hardware10CameraInfoE(
++        int cameraId, android::hardware::CameraInfo* cameraInfo) {
++    return CameraBase<Camera>::getCameraInfo(cameraId, /*overrideToPortrait*/ false, cameraInfo);
++}
++
++// static status_t Camera::connectLegacy(int, int, const String16&, int, sp<Camera>&):
++// removed in Android 10 together with HAL1 connections through cameraservice.
++// Only the video-telephony libraries of the Meizu MX6 import it.
++status_t _ZN7android6Camera13connectLegacyEiiRKNS_8String16EiRNS_2spIS0_EE(
++        int /*cameraId*/, int /*halVersion*/, const String16& /*clientPackageName*/,
++        int /*clientUid*/, sp<Camera>& camera) {
++    camera.clear();
++    return android::INVALID_OPERATION;
++}
++
++}  // extern "C"

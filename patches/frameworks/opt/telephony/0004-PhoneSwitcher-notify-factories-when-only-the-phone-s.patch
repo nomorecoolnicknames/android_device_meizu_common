@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 13:46:43 +0300
+Subject: [PATCH] PhoneSwitcher: notify factories when only the phone->subId
+ mapping changes
+
+With the legacy setDataAllowed path (HAL_COMMAND_ALLOW_DATA) the network
+factories re-check their requests only on mActivePhoneRegistrants, which
+fires from onDdsSwitchResponse, i.e. after a RIL command. When the SIM
+loads after radio on, phone 0 is already active and only its subId goes
+from -1 to a valid one, so no command is sent and no notification
+follows. Every request that reached TelephonyNetworkFactory while the
+subId was invalid (shouldApplyNetworkRequest returns false then) stays
+"not applied" until the next real switch.
+
+On the Meizu MX6, 22 hours after boot, the mobile-data-always-on
+BACKGROUND_REQUEST was still UNSATISFIED and "not applied" in
+TelephonyNetworkFactory-0. The data call that later requests brought up
+had no request left once Wi-Fi validated, was lost (LOST_CONNECTION) and
+was never set up again.
+
+If the evaluation changed the mapping but not the active set, there is
+no command in flight to wait for, so notify the registrants right away.
+TelephonyNetworkFactory.onActivePhoneSwitch then applies or releases
+each request by shouldApplyNetworkRequest, and changes nothing that is
+already right.
+
+Change-Id: I389216a129fbe3fb055406e1298f45a02bad912c
+
+diff --git a/src/java/com/android/internal/telephony/data/PhoneSwitcher.java b/src/java/com/android/internal/telephony/data/PhoneSwitcher.java
+index 411186c..aa5e92f 100644
+--- a/src/java/com/android/internal/telephony/data/PhoneSwitcher.java
++++ b/src/java/com/android/internal/telephony/data/PhoneSwitcher.java
+@@ -1074,6 +1074,7 @@ public class PhoneSwitcher extends Handler {
+         boolean hasAnyActiveSubscription = false;
+ 
+         // Check if phoneId to subId mapping is changed.
++        boolean phoneSubChanged = false;
+         for (int i = 0; i < mActiveModemCount; i++) {
+             int sub = mSubscriptionController.getSubIdUsingPhoneId(i);
+ 
+@@ -1084,6 +1085,7 @@ public class PhoneSwitcher extends Handler {
+                 sb.append("->").append(sub);
+                 mPhoneSubscriptions[i] = sub;
+                 diffDetected = true;
++                phoneSubChanged = true;
+             }
+         }
+ 
+@@ -1184,16 +1186,32 @@ public class PhoneSwitcher extends Handler {
+                     for (Integer i : newActivePhones) log("  " + i);
+                 }
+ 
++                boolean activeSetChanged = false;
+                 for (int phoneId = 0; phoneId < mActiveModemCount; phoneId++) {
+                     if (!newActivePhones.contains(phoneId)) {
++                        activeSetChanged |= mPhoneStates[phoneId].active;
+                         deactivate(phoneId);
+                     }
+                 }
+ 
+                 // only activate phones up to the limit
+                 for (int phoneId : newActivePhones) {
++                    activeSetChanged |= !mPhoneStates[phoneId].active;
+                     activate(phoneId);
+                 }
++
++                // Legacy IRadio (setDataAllowed): the network factories re-check
++                // their requests only on mActivePhoneRegistrants, which fires from
++                // onDdsSwitchResponse, i.e. only after a RIL command. When the SIM loads
++                // after radio on, the phone is already active and only its subId changes
++                // (-1 -> valid), so no command is sent and every request that arrived while
++                // the subId was invalid stays "not applied" in TelephonyNetworkFactory for
++                // good -- the mobile-data-always-on background request included. With
++                // no command in flight there is nothing to wait for: tell them now.
++                if (phoneSubChanged && !activeSetChanged) {
++                    log("phone->subId mapping changed without a switch, notify active phones");
++                    mActivePhoneRegistrants.notifyRegistrants();
++                }
+             }
+         }
+         return diffDetected;

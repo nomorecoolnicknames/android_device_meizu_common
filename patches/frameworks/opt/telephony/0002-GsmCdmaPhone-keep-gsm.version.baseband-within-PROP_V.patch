@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 19:28:42 +0300
+Subject: [PATCH] GsmCdmaPhone: keep gsm.version.baseband within PROP_VALUE_MAX
+ on multi-SIM
+
+The per-phone cap was PROP_VALUE_MAX/2 (46), so two capped values joined
+with ',' are 93 bytes, over the 91-byte limit; a ',' inside a value is also
+escaped as '\,' by the list property. A MediaTek modem reports
+'<build>, <date>' (Meizu MX6: 'Y.LR11.W1603.MD.MP.V62.4.P9, 2018/01/16
+14:57'), so SystemProperties.set threw IllegalArgumentException and
+com.android.phone crashed on every start. Replace the commas and size each
+value as (PROP_VALUE_MAX - phones) / phones, which always fits once joined.
+
+Change-Id: Icc0df7026ca85396addf22c0fd089f273f5e654f
+
+diff --git a/src/java/com/android/internal/telephony/GsmCdmaPhone.java b/src/java/com/android/internal/telephony/GsmCdmaPhone.java
+index e865f18..76238ac 100644
+--- a/src/java/com/android/internal/telephony/GsmCdmaPhone.java
++++ b/src/java/com/android/internal/telephony/GsmCdmaPhone.java
+@@ -3123,8 +3123,17 @@ public class GsmCdmaPhone extends Phone {
+                 */
+                 String version = (String)ar.result;
+                 if (version != null) {
++                    // gsm.version.baseband is a list property: the per-phone values are
++                    // joined with ',' and a ',' inside a value is escaped as "\,". A
++                    // MediaTek modem reports "<build>, <date>" (Meizu MX6:
++                    // "Y.LR11.W1603.MD.MP.V62.4.P9, 2018/01/16 14:57"), and PROP_VALUE_MAX/2
++                    // per phone let two such values exceed the 91-byte limit once joined:
++                    // SystemProperties.set threw and com.android.phone crashed on every
++                    // start. Drop the commas and size each value so the list always fits.
++                    version = version.replace(',', ' ');
++                    final int phones = Math.max(1, TelephonyManager.from(mContext).getActiveModemCount());
+                     int length = version.length();
+-                    final int MAX_VERSION_LEN = SystemProperties.PROP_VALUE_MAX/2;
++                    final int MAX_VERSION_LEN = (SystemProperties.PROP_VALUE_MAX - phones) / phones;
+                     TelephonyManager.from(mContext).setBasebandVersionForPhone(getPhoneId(),
+                             length <= MAX_VERSION_LEN ? version
+                                 : version.substring(length - MAX_VERSION_LEN, length));

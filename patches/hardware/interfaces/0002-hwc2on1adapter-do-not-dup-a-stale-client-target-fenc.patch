@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 14:32:58 +0300
+Subject: [PATCH] hwc2on1adapter: do not dup a stale client target fence for an
+ unused FBT
+
+When no layer is HWC_FRAMEBUFFER the HWC1 device does not read the
+framebuffer target, and SurfaceFlinger has not set a client target for the
+frame, so mClientTarget still holds the signaled fence of the last
+client-composited frame. set() dup'ed it into the FBT acquire fence on every
+such frame. HWC1 gives acquire fences to the device, but a device that never
+reads the target may not close them. Pass -1, which means the same as a
+signaled fence.
+
+Seen on the Meizu MX6 with the MediaTek MT6797 HWC 1.5 blob: one sync_fence
+fd leaked per fully device-composited frame (+16.4 fd/s in camera preview,
+strace shows the dup never closed) until the composer reached its 32768 fd
+limit, followed by a NoResources storm and a permanent fallback to GLES
+composition.
+
+Change-Id: Ib3c525025dc28c743f3ce20efa8cc6695cf40326
+
+diff --git a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+index 3702171..2ae7cd0 100644
+--- a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
++++ b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+@@ -1282,9 +1282,11 @@ Error HWC2On1Adapter::Display::set(hwc_display_contents_1& hwcContents) {
+ 
+     // Close acquire fences on FRAMEBUFFER layers, since they will not be used
+     // by HWC
++    bool hasClientLayers = false;
+     for (size_t l = 0; l < numLayers - 1; ++l) {
+         auto& layer = hwcContents.hwLayers[l];
+         if (layer.compositionType == HWC_FRAMEBUFFER) {
++            hasClientLayers = true;
+             ALOGV("Closing fence %d for layer %zd", layer.acquireFenceFd, l);
+             close(layer.acquireFenceFd);
+             layer.acquireFenceFd = -1;
+@@ -1294,7 +1296,17 @@ Error HWC2On1Adapter::Display::set(hwc_display_contents_1& hwcContents) {
+     auto& clientTargetLayer = hwcContents.hwLayers[numLayers - 1];
+     if (clientTargetLayer.compositionType == HWC_FRAMEBUFFER_TARGET) {
+         clientTargetLayer.handle = mClientTarget.getBuffer();
+-        clientTargetLayer.acquireFenceFd = mClientTarget.getFence();
++        if (hasClientLayers) {
++            clientTargetLayer.acquireFenceFd = mClientTarget.getFence();
++        } else {
++            // With no FRAMEBUFFER layer the device does not read the
++            // framebuffer target, and mClientTarget still holds the signaled
++            // fence of the last client-composited frame. A device that never
++            // reads the target may not close its acquire fence either (the
++            // MediaTek HWC 1.5 blob does not), so a dup here would leak one
++            // fd per frame.
++            clientTargetLayer.acquireFenceFd = -1;
++        }
+     } else {
+         ALOGE("[%" PRIu64 "] set: last HWC layer wasn't FRAMEBUFFER_TARGET",
+                 mId);

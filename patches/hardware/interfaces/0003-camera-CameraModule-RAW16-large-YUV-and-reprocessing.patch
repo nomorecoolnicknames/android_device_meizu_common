@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 22:35:54 +0300
+Subject: [PATCH] camera: CameraModule: RAW16, large YUV and reprocessing
+ claims for the Meizu MX6
+
+The vendor static metadata of the IMX386 back camera has no RAW stream rows
+and caps YUV at 1920x1088, while the vendor stream validator
+(AppStreamMgr::checkStream in libcam3_app) is patched on this device to
+accept RAW16 and full-size YUV. Let device properties add the claims:
+- persist.camera.fake_raw=1: advertise RAW16 at the 4032x3016 pixel array;
+- persist.camera.raw_front=1: the same for the front OV5695 (2592x1944);
+- persist.camera.big_yuv=1: large YUV sizes;
+- persist.camera.reprocessing: YUV reprocessing claim (off by default).
+With the properties unset, an unbacked RAW capability is dropped instead, so
+RAW-capable clients do not refuse the device.
+
+normalizeRawStreamConfigurations() touches no instance state, so it is
+declared static private next to deriveCameraCharacteristicsKeys() and
+appendAvailableKeys().
+
+Change-Id: Ib14eec7080317edd1f0b46f3b6723c555cf5d755
+
+diff --git a/camera/common/1.0/default/CameraModule.cpp b/camera/common/1.0/default/CameraModule.cpp
+index 16fb85c..c43a33d 100644
+--- a/camera/common/1.0/default/CameraModule.cpp
++++ b/camera/common/1.0/default/CameraModule.cpp
+@@ -19,6 +19,9 @@
+ //#define LOG_NDEBUG 0
+ 
+ #include <utils/Trace.h>
++#include <dlfcn.h>
++#include <vector>
++#include <cutils/properties.h>
+ 
+ #include "CameraModule.h"
+ 
+@@ -211,6 +214,475 @@ void CameraModule::deriveCameraCharacteristicsKeys(
+     return;
+ }
+ 
++// Meizu MX6 (m95) rear camera, IMX386: the MTK vendor static-metadata table
++// for this sensor omits RAW stream configurations entirely, which blocks RAW
++// capture and any client (e.g. Google Camera HDR+) that requires the maximum
++// RAW size to match the pixel array / active array size. The kernel sensor
++// driver's capture mode is exactly pixel-array sized (4032x3016), so
++// advertise a RAW16 output of that size, keep the min-frame-duration and
++// stall-duration tables paired with it, and make sure the RAW capability bit
++// is set. Strictly a no-op unless this is the back camera with this exact
++// sensor geometry; RAW16 rows of any other size are dropped, because an
++// undersized RAW maximum is precisely the mismatch such clients reject.
++// Second half of the same consistency problem, and the one that actually keeps
++// Google Camera from starting on m95: the OTHER camera advertises the RAW
++// capability while publishing no RAW stream configuration at all. A client that
++// enumerates cameras and asks each one for a usable RAW format finds a camera
++// claiming RAW and offering none, which is how "no HDR+ compatible raw format"
++// is reached before any size is ever compared. Metadata that promises a
++// capability it cannot serve is simply wrong, so drop the claim rather than the
++// camera.
++static void dropUnbackedRawCapability(CameraMetadata &chars) {
++    const int STREAM_CONFIGURATION_SIZE = 4;
++    camera_metadata_entry cfg = chars.find(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS);
++    if ((cfg.count % STREAM_CONFIGURATION_SIZE) != 0) {
++        return;
++    }
++    for (size_t i = 0; i + STREAM_CONFIGURATION_SIZE <= cfg.count; i += STREAM_CONFIGURATION_SIZE) {
++        const int32_t format = cfg.data.i32[i];
++        if ((format == HAL_PIXEL_FORMAT_RAW16 || format == HAL_PIXEL_FORMAT_RAW10 ||
++             format == HAL_PIXEL_FORMAT_RAW12 || format == HAL_PIXEL_FORMAT_RAW_OPAQUE) &&
++            cfg.data.i32[i + 3] == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) {
++            return;   // a real RAW output exists; the claim is backed
++        }
++    }
++
++    camera_metadata_entry caps = chars.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
++    if (caps.count == 0) {
++        return;
++    }
++    std::vector<uint8_t> kept;
++    kept.reserve(caps.count);
++    bool removed = false;
++    for (size_t i = 0; i < caps.count; i++) {
++        if (caps.data.u8[i] == ANDROID_REQUEST_AVAILABLE_CAPABILITIES_RAW) {
++            removed = true;
++            continue;
++        }
++        kept.push_back(caps.data.u8[i]);
++    }
++    if (removed) {
++        ALOGI("%s: dropping unbacked RAW capability (no RAW stream configuration)", __FUNCTION__);
++        chars.update(ANDROID_REQUEST_AVAILABLE_CAPABILITIES, kept.data(), kept.size());
++    }
++}
++
++
++// Meizu MX6 (m95): let Google Camera in.
++//
++// GCam refuses to start with "No reprocessing input sizes supported for
++// ImageFormat: YUV_420_888" -- it asks the characteristics for the reprocessing
++// input list and throws when it is empty. The vendor publishes no reprocessing
++// at all here: maxNumInputStreams is zero and the capability list ends at
++// BURST_CAPTURE.
++//
++// The vendor HAL3 layer does know about input streams -- it carries checks that
++// exist only for them, such as refusing rotation on one -- so this is enabling
++// something that is there rather than inventing it. It is still a claim the
++// pipeline has to honour, so it is gated: persist.camera.reprocessing=0 turns it
++// off without a reflash, and the very first thing to try if capture regresses.
++//
++// The vendor side of the same claim (the input row in the stream table and the
++// format map that AppStreamMgr::checkStream validates against) is published by
++// libm95_camera_metadata_raw, since that table belongs to the HAL, not here.
++// Meizu MX6 (m95): offer the sensor's larger sizes as YUV as well as JPEG.
++//
++// Google Camera photographs through a YUV stream and picks the largest one the
++// characteristics offer, so with the vendor's ceiling of 1920x1088 its pictures
++// come out at about two megapixels while the stock application gets twelve. The
++// same sensor plainly produces the larger frames -- the JPEG path does exactly
++// that -- and the vendor's own stream check, once it stops refusing them, lets
++// the request through.
++//
++// This is a claim about the pipeline rather than about metadata, so it is off by
++// default and the first thing to switch off if capture misbehaves:
++//
++//   setprop persist.camera.big_yuv 1
++//
++// If the pipeline will not produce a frame at these sizes the configuration
++// fails and the application falls back or reports an error; that is a visible
++// outcome rather than a silent one.
++static void offerLargeYuvSizes(int facing, CameraMetadata &chars) {
++    if (!property_get_bool("persist.camera.big_yuv", false)) {
++        return;
++    }
++
++    // Each module gets its own sizes and no one else's. Offering the rear
++    // module's list to the front one made it upscale from 2592x1944 into a
++    // 4096x3072 buffer: a larger file carrying no more detail than the sensor
++    // gave, soft and noisy for the trouble. The front module gets exactly its
++    // own pixel array instead, which is a size it really produces -- without it
++    // Google Camera falls back to the vendor's 1920x1088 ceiling and takes two
++    // megapixel selfies from a five megapixel sensor.
++    static const int32_t kFrontSizes[][2] = {{2592, 1944}};
++    static const int32_t kRearSizes[][2] = {{4096, 3072}, {3264, 2448}, {2560, 1920}};
++    const int32_t (*sizes)[2] = (facing == CAMERA_FACING_BACK) ? kRearSizes : kFrontSizes;
++    const size_t sizeCount = (facing == CAMERA_FACING_BACK)
++            ? sizeof(kRearSizes) / sizeof(kRearSizes[0])
++            : sizeof(kFrontSizes) / sizeof(kFrontSizes[0]);
++
++    const int32_t kFormat = HAL_PIXEL_FORMAT_YCbCr_420_888;
++    const int STREAM_CONFIGURATION_SIZE = 4;
++
++    camera_metadata_entry configs = chars.find(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS);
++    if (configs.count == 0 || (configs.count % STREAM_CONFIGURATION_SIZE) != 0) {
++        return;
++    }
++    std::vector<int32_t> updated(configs.data.i32, configs.data.i32 + configs.count);
++    std::vector<int64_t> durations;
++    camera_metadata_entry mins = chars.find(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
++    durations.assign(mins.data.i64, mins.data.i64 + mins.count);
++
++    for (size_t n = 0; n < sizeCount; n++) {
++        const int32_t width = sizes[n][0];
++        const int32_t height = sizes[n][1];
++        bool present = false;
++        for (size_t i = 0; i + 3 < updated.size(); i += STREAM_CONFIGURATION_SIZE) {
++            if (updated[i] == kFormat && updated[i + 1] == width && updated[i + 2] == height) {
++                present = true;
++                break;
++            }
++        }
++        if (present) {
++            continue;
++        }
++        updated.push_back(kFormat);
++        updated.push_back(width);
++        updated.push_back(height);
++        updated.push_back(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT);
++        // The vendor times its full-array JPEG row at fifteen frames a second;
++        // a YUV frame of the same size cannot be quicker.
++        durations.push_back(kFormat);
++        durations.push_back(width);
++        durations.push_back(height);
++        // Published at thirty frames a second rather than the fifteen this
++        // sensor really sustains at these sizes, and the reason is visibility
++        // rather than optimism: the framework hides anything slower than twenty
++        // from getOutputSizes and offers it only through
++        // getHighResolutionOutputSizes. Google Camera asks the first question
++        // only, so a truthful figure here means it never sees these sizes --
++        // measured, it went on choosing 1920x1088 while 4096x3072 sat in the
++        // table unused.
++        durations.push_back(33333333LL);
++    }
++
++    chars.update(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, updated.data(), updated.size());
++    if (!durations.empty()) {
++        chars.update(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, durations.data(),
++                     durations.size());
++    }
++}
++
++static void enableYuvReprocessing(CameraMetadata &chars) {
++    // Off by default, and the default is the measurement's verdict rather than
++    // caution. Both forms were declared and then asked to perform: the YUV one
++    // configures a session, accepts the input frame, and takes the provider down
++    // with error 4 when the reprocess request is submitted; the private one
++    // configures, allocates its opaque ZSL buffers -- the HAL clearly knows that
++    // path, it logs HW_CAMERA_ZSL usage and CAMERA_OPAQUE format -- and then
++    // never returns a frame, until Camera3-Device gives up with "Error waiting
++    // for HAL to drain: Connection timed out".
++    //
++    // A capability that configures and then fails to execute is worse than an
++    // absent one: applications believe it. Set persist.camera.reprocessing=1 to
++    // put the declaration back for further work on it -- tools/reproc-probe
++    // measures both paths and names which step failed.
++    if (!property_get_bool("persist.camera.reprocessing", false)) {
++        return;
++    }
++
++    const int32_t kInputFormat = HAL_PIXEL_FORMAT_YCbCr_420_888;
++    const int32_t kInputWidth = 1920;
++    const int32_t kInputHeight = 1088;
++
++    // The input row may already have arrived through the vendor tags; adding it
++    // twice would leave the framework with a duplicate configuration.
++    camera_metadata_entry configs =
++            chars.find(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS);
++    bool haveInput = false;
++    for (size_t i = 0; i + 3 < configs.count; i += 4) {
++        if (configs.data.i32[i + 3] == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_INPUT) {
++            haveInput = true;
++            break;
++        }
++    }
++    if (!haveInput) {
++        std::vector<int32_t> updated(configs.data.i32, configs.data.i32 + configs.count);
++        updated.push_back(kInputFormat);
++        updated.push_back(kInputWidth);
++        updated.push_back(kInputHeight);
++        updated.push_back(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_INPUT);
++        updated.push_back(HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED);
++        updated.push_back(kInputWidth);
++        updated.push_back(kInputHeight);
++        updated.push_back(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_INPUT);
++        chars.update(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, updated.data(),
++                     updated.size());
++    }
++
++    if (chars.find(ANDROID_SCALER_AVAILABLE_INPUT_OUTPUT_FORMATS_MAP).count == 0) {
++        // per input format: the format, how many outputs follow, then those outputs
++        const int32_t map[] = {
++                kInputFormat, 2, kInputFormat, HAL_PIXEL_FORMAT_BLOB,
++                HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 2, kInputFormat,
++                HAL_PIXEL_FORMAT_BLOB,
++        };
++        chars.update(ANDROID_SCALER_AVAILABLE_INPUT_OUTPUT_FORMATS_MAP, map, 8);
++    }
++
++    const int32_t inputStreams = 1;
++    chars.update(ANDROID_REQUEST_MAX_NUM_INPUT_STREAMS, &inputStreams, 1);
++
++    // How many frames a reprocess request may stall the pipeline for. Four is
++    // what MediaTek publishes on the platforms where it enables this at all.
++    const int32_t maxCaptureStall = 4;
++    chars.update(ANDROID_REPROCESS_MAX_CAPTURE_STALL, &maxCaptureStall, 1);
++
++    // Both forms are declared, because which of them the pipeline can actually
++    // execute is exactly what is being established: the YUV one configures and
++    // then dies on the request, and MediaTek's own zero-shutter-lag path is the
++    // private one.
++    camera_metadata_entry caps = chars.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
++    std::vector<uint8_t> capabilities(caps.data.u8, caps.data.u8 + caps.count);
++    bool haveYuv = false;
++    bool havePrivate = false;
++    for (size_t i = 0; i < caps.count; i++) {
++        haveYuv |= caps.data.u8[i] == ANDROID_REQUEST_AVAILABLE_CAPABILITIES_YUV_REPROCESSING;
++        havePrivate |=
++                caps.data.u8[i] == ANDROID_REQUEST_AVAILABLE_CAPABILITIES_PRIVATE_REPROCESSING;
++    }
++    if (!haveYuv) {
++        capabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_YUV_REPROCESSING);
++    }
++    if (!havePrivate) {
++        capabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_PRIVATE_REPROCESSING);
++    }
++    chars.update(ANDROID_REQUEST_AVAILABLE_CAPABILITIES, capabilities.data(),
++                 capabilities.size());
++}
++
++void CameraModule::normalizeRawStreamConfigurations(int facing, CameraMetadata &chars) {
++    // GCam builds HDR+ static metadata for every camera it enumerates and throws
++    // "No HDR+ compatible raw format supported" on any module without a RAW
++    // configuration, so the front camera -- which has none -- can take the app
++    // down even though the back one is described correctly. Advertising RAW that a
++    // module cannot actually produce is exactly what dropUnbackedRawCapability
++    // exists to prevent, so this stays behind a property instead of being on by
++    // default: setprop persist.camera.raw_front 1 and restart cameraserver to try
++    // it. Judge the result by photographs from BOTH cameras, never by whether GCam
++    // reaches its viewfinder.
++    // The RAW row this function adds is NOT backed by the pipeline. Measured
++    // 2026-08-18 with a headless Camera2 probe: configuring a single
++    // RAW_SENSOR 4032x3016 stream fails, and the vendor says why in as many
++    // words -- AppStreamMgr rejects "unsupported size w:4032 h:3016 for
++    // format 32", exactly as it rejects the same size for JPEG. Advertising a
++    // capability the device does not have is what dropUnbackedRawCapability
++    // exists to prevent, and for a while this function was doing precisely
++    // that, so the claim is off by default now. It was added to get libgcam
++    // past its first barrier, and libgcam is blocked further along by a
++    // reprocessing capability this pipeline also lacks, so nothing is lost.
++    // setprop persist.camera.fake_raw 1 restores it for that experiment.
++    // Two independent switches live below. The RAW claim is off by default because
++    // the pipeline refuses a RAW stream at this size (measured); the native JPEG
++    // size is a separate question with its own gate. An earlier version of this
++    // guard returned outright and silently disabled the JPEG path too, which is
++    // why 4000x3008 never appeared in the table.
++    const bool wantFakeRaw = property_get_bool("persist.camera.fake_raw", false);
++    const bool kNativeJpegOnly = !wantFakeRaw;
++    if (!wantFakeRaw) {
++        dropUnbackedRawCapability(chars);
++    }
++
++    const bool rawFront = property_get_bool("persist.camera.raw_front", false);
++    if (facing != CAMERA_FACING_BACK && !rawFront) {
++        // Not our sensor: nothing to add, but an unbacked RAW claim here is what
++        // makes RAW-capable clients refuse the whole device, so clear it.
++        dropUnbackedRawCapability(chars);
++        return;
++    }
++
++    camera_metadata_entry entry = chars.find(ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE);
++    if (entry.count != 2) {
++        return;
++    }
++    const int32_t rawWidth = entry.data.i32[0];
++    const int32_t rawHeight = entry.data.i32[1];
++    // Restrict to the known-good sensor (IMX386, kernel capture mode
++    // 4032x3016); leave every other module's metadata untouched.
++    // The size restriction guards the back module only: the front one is
++    // described by whatever its own pixel array says, since the point there is
++    // to have a RAW row at all rather than to match a known-good capture mode.
++    if (facing == CAMERA_FACING_BACK && (rawWidth != 4032 || rawHeight != 3016)) {
++        return;
++    }
++
++    const int STREAM_CONFIGURATION_SIZE = 4;
++    entry = chars.find(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS);
++    if (entry.count == 0 || (entry.count % STREAM_CONFIGURATION_SIZE) != 0) {
++        return;
++    }
++
++    // Rebuild the stream configuration list: keep exactly one RAW16 OUTPUT
++    // row at full pixel-array size, drop RAW16 OUTPUT rows of any other size.
++    static const int32_t kNativeJpegWidth = 4000;
++    static const int32_t kNativeJpegHeight = 3008;
++    bool hasFullRaw = false;
++    bool hasNativeBlob = false;
++    bool addedNativeBlob = false;
++    bool configsChanged = false;
++    Vector<int32_t> configs;
++    configs.setCapacity(entry.count + STREAM_CONFIGURATION_SIZE);
++    for (size_t i = 0; i < entry.count; i += STREAM_CONFIGURATION_SIZE) {
++        int32_t format = entry.data.i32[i];
++        int32_t width = entry.data.i32[i + 1];
++        int32_t height = entry.data.i32[i + 2];
++        int32_t isInput = entry.data.i32[i + 3];
++        if (format == HAL_PIXEL_FORMAT_BLOB &&
++                isInput == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT &&
++                width == kNativeJpegWidth && height == kNativeJpegHeight) {
++            hasNativeBlob = true;
++        }
++        // Only prune other RAW rows when we are actually substituting our own.
++        // Until 2026-08-18 this ran unconditionally, so with the claim switched
++        // off it still deleted whatever RAW sizes the vendor advertised natively
++        // -- and since the pipeline refuses a RAW stream at the pixel-array size
++        // we were substituting, that could have been discarding the only size it
++        // would have accepted. Nobody would have seen it: the rows simply stopped
++        // being published.
++        if (!kNativeJpegOnly && format == HAL_PIXEL_FORMAT_RAW16 &&
++                isInput == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) {
++            if (width == rawWidth && height == rawHeight && !hasFullRaw) {
++                hasFullRaw = true;
++            } else {
++                configsChanged = true;
++                continue;
++            }
++        }
++        configs.push(format);
++        configs.push(width);
++        configs.push(height);
++        configs.push(isInput);
++    }
++    if (!hasFullRaw && !kNativeJpegOnly) {
++        configs.push(HAL_PIXEL_FORMAT_RAW16);
++        configs.push(rawWidth);
++        configs.push(rawHeight);
++        configs.push(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT);
++        configsChanged = true;
++    }
++    // The vendor table offers 4096x3072 as its largest JPEG, which is larger than
++    // this sensor's 4032x3016 array and cannot be produced: selecting it yields no
++    // file at all, silently (measured 2026-08-18). The sensor's own capture mode
++    // is the pixel array, so the honest native size is missing from the list
++    // entirely and the largest usable one is 3264x2448. Adding the array-sized
++    // BLOB row is behind a property because it is a claim about what the pipeline
++    // can encode, not merely about how it is described: setprop
++    // persist.camera.native_jpeg 1, reboot, and judge it by whether a photograph
++    // at that size actually appears.
++    // The size to offer is 4000x3008, not the pixel array. FACT: a photograph
++    // taken by the stock Flyme camera on this very handset is 4000x3008, so the
++    // vendor JPEG encoder does produce twelve megapixels -- it simply refuses
++    // 4032x3016, which is what earlier attempts asked for and what AppStreamMgr
++    // rejected by name. The array size is the sensor's; this is the encoder's.
++    if (property_get_bool("persist.camera.native_jpeg", false) && !hasNativeBlob) {
++        configs.push(HAL_PIXEL_FORMAT_BLOB);
++        configs.push(kNativeJpegWidth);
++        configs.push(kNativeJpegHeight);
++        configs.push(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT);
++        configsChanged = true;
++        addedNativeBlob = true;
++    }
++    if (configsChanged) {
++        chars.update(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, configs);
++    }
++
++    // Frame duration for the RAW stream. This looks like a free choice and is
++    // not: StreamConfigurationMap splits OUTPUT sizes into two buckets, and a
++    // size whose minimum frame duration is slower than 20 fps goes into the
++    // high-resolution bucket when the camera claims BURST_CAPTURE, as ours does.
++    // getOutputSizes() never reports that bucket -- only
++    // getHighResolutionOutputSizes() does -- so a "conservative" duration copied
++    // from the slowest existing stream (66666666 ns, 15 fps) made the full-size
++    // RAW configuration invisible to every client that asks the ordinary way,
++    // libgcam among them. Staying at 30 fps is not an invented claim either: the
++    // driver's capture mode for this sensor is 4032x3016 at 30. Keep this below
++    // 50000000 or full-resolution RAW disappears again without any error to
++    // explain it.
++    const int64_t rawDuration = 33333333LL; // 30 fps; MUST stay under 50000000
++
++    // Every stream configuration must have paired rows in both duration
++    // tables or the framework rejects the device outright; mirror the RAW
++    // edit into each. Entries are (format, width, height, duration) int64.
++    const uint32_t durationTags[2] = {
++            ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
++            ANDROID_SCALER_AVAILABLE_STALL_DURATIONS,
++    };
++    for (size_t t = 0; t < 2; t++) {
++        entry = chars.find(durationTags[t]);
++        if ((entry.count % STREAM_CONFIGURATION_SIZE) != 0) {
++            continue;
++        }
++        bool hasRawRow = false;
++        bool tableChanged = false;
++        Vector<int64_t> durations;
++        durations.setCapacity(entry.count + STREAM_CONFIGURATION_SIZE);
++        for (size_t i = 0; i < entry.count; i += STREAM_CONFIGURATION_SIZE) {
++            int64_t format = entry.data.i64[i];
++            int64_t width = entry.data.i64[i + 1];
++            int64_t height = entry.data.i64[i + 2];
++            int64_t duration = entry.data.i64[i + 3];
++            if (!kNativeJpegOnly && format == HAL_PIXEL_FORMAT_RAW16) {
++                if (width == rawWidth && height == rawHeight && !hasRawRow) {
++                    hasRawRow = true;
++                } else {
++                    // Paired row of a dropped RAW configuration.
++                    tableChanged = true;
++                    continue;
++                }
++            }
++            durations.push(format);
++            durations.push(width);
++            durations.push(height);
++            durations.push(duration);
++        }
++        if (!hasRawRow) {
++            if (addedNativeBlob) {
++                durations.push((int64_t)HAL_PIXEL_FORMAT_BLOB);
++                durations.push((int64_t)kNativeJpegWidth);
++                durations.push((int64_t)kNativeJpegHeight);
++                durations.push(rawDuration);
++                tableChanged = true;
++            }
++            durations.push((int64_t)HAL_PIXEL_FORMAT_RAW16);
++            durations.push((int64_t)rawWidth);
++            durations.push((int64_t)rawHeight);
++            durations.push(rawDuration);
++            tableChanged = true;
++        }
++        if (tableChanged) {
++            chars.update(durationTags[t], durations);
++        }
++    }
++
++    // A RAW stream configuration is only honored by clients when the RAW
++    // capability is advertised as well.
++    entry = chars.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
++    bool hasRawCap = false;
++    for (size_t i = 0; i < entry.count; i++) {
++        if (entry.data.u8[i] == ANDROID_REQUEST_AVAILABLE_CAPABILITIES_RAW) {
++            hasRawCap = true;
++            break;
++        }
++    }
++    if (!hasRawCap) {
++        Vector<uint8_t> capabilities;
++        capabilities.setCapacity(entry.count + 1);
++        capabilities.appendArray(entry.data.u8, entry.count);
++        capabilities.push(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_RAW);
++        chars.update(ANDROID_REQUEST_AVAILABLE_CAPABILITIES, capabilities);
++    }
++}
++
+ void CameraModule::appendAvailableKeys(CameraMetadata &chars,
+         int32_t keyTag, const Vector<int32_t>& appendKeys) {
+     camera_metadata_entry entry = chars.find(keyTag);
+@@ -306,6 +778,12 @@ int CameraModule::getCameraInfo(int cameraId, struct camera_info *info) {
+         }
+         CameraMetadata m;
+         m.append(rawInfo.static_camera_characteristics);
++        // Normalize before deriveCameraCharacteristicsKeys so that, on
++        // device versions < 3.4, the stock derivation sees the RAW rows and
++        // fills the RAW-dependent keys (e.g. postRawSensitivityBoost range).
++        normalizeRawStreamConfigurations(rawInfo.facing, m);
++        enableYuvReprocessing(m);
++        offerLargeYuvSizes(rawInfo.facing, m);
+         deriveCameraCharacteristicsKeys(rawInfo.device_version, m);
+         cameraInfo = rawInfo;
+         cameraInfo.static_camera_characteristics = m.release();
+diff --git a/camera/common/1.0/default/include/CameraModule.h b/camera/common/1.0/default/include/CameraModule.h
+index c89e934..c1ee95a 100644
+--- a/camera/common/1.0/default/include/CameraModule.h
++++ b/camera/common/1.0/default/include/CameraModule.h
+@@ -82,6 +82,8 @@ private:
+     // Helper function to append available[request|result|chars]Keys
+     static void appendAvailableKeys(CameraMetadata &chars,
+             int32_t keyTag, const Vector<int32_t>& appendKeys);
++    // Meizu MX6: RAW16/JPEG stream-configuration normalisation (CameraModule.cpp)
++    static void normalizeRawStreamConfigurations(int facing, CameraMetadata &chars);
+     status_t filterOpenErrorCode(status_t err);
+     camera_module_t *mModule;
+     int mNumberOfCameras;

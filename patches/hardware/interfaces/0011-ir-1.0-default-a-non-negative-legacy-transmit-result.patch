@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 22:29:31 +0300
+Subject: [PATCH] ir: 1.0 default: a non-negative legacy transmit result is
+ success
+
+MediaTek's consumerir.mt6797 returns the result of write() to /dev/irtx,
+i.e. the byte count, after a complete transmission. The HIDL wrapper only
+accepted 0, so every successful transmit was reported as a failure
+(ConsumerIrService 'Error transmitting: -1' while the HAL logged 'Send to
+driver: Exit' 170 ms later on the Meizu MX6). Nougat's ConsumerIrService
+also treated only negative values as errors.
+
+Change-Id: I2484fd4c6cafb905bb1b78a54105a655bf895306
+
+diff --git a/ir/1.0/default/ConsumerIr.cpp b/ir/1.0/default/ConsumerIr.cpp
+index 821fd7e..d1fc159 100644
+--- a/ir/1.0/default/ConsumerIr.cpp
++++ b/ir/1.0/default/ConsumerIr.cpp
+@@ -43,7 +43,12 @@ Return<bool> ConsumerIr::transmit(int32_t carrierFreq, const hidl_vec<int32_t>&
+     // signals_generate faulted with SEGV_ACCERR on the first transmit, the HAL died
+     // and system_server aborted on the dead binder (2026-10-06).
+     std::vector<int> copy(pattern.begin(), pattern.end());
+-    return mDevice->transmit(mDevice, carrierFreq, copy.data(), copy.size()) == 0;
++    // Success is "not negative": the same blob returns what write() to /dev/irtx
++    // returned -- the byte count -- after a complete transmission (consumerir
++    // .mt6797 transmit epilogue returns the write result; 2026-10-06 the LED path
++    // ran its full 170 ms and the service still logged "Error transmitting: -1").
++    // Nougat's ConsumerIrService treated only negative values as errors.
++    return mDevice->transmit(mDevice, carrierFreq, copy.data(), copy.size()) >= 0;
+ }
+ 
+ Return<void> ConsumerIr::getCarrierFreqs(getCarrierFreqs_cb _hidl_cb) {

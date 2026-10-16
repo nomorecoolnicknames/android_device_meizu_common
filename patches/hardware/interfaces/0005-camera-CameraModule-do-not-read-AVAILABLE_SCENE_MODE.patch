@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 05:20:06 +0300
+Subject: [PATCH] camera: CameraModule: do not read AVAILABLE_SCENE_MODES that
+ is not there
+
+deriveCameraCharacteristicsKeys() (device versions below 3.3) read
+entry.data.u8[0] of ANDROID_CONTROL_AVAILABLE_SCENE_MODES unconditionally.
+When the HAL does not publish the key, find() returns count 0 and a NULL
+data pointer, and the provider dies before registering:
+
+  SIGSEGV fault addr 0x0 in CameraModule::deriveCameraCharacteristicsKeys
+  (CameraModule.cpp:51) <- CameraModule::getCameraInfo <-
+  LegacyCameraProviderImpl_2_4::initialize
+
+(Meizu M5c, MediaTek camera HAL forced to device 3.2 with sparse static
+metadata.) Treat an absent key like a single DISABLED entry:
+USE_SCENE_MODE is not advertised.
+
+Change-Id: If5f73c5448e608c887e7fba30b6da88494b69c09
+
+diff --git a/camera/common/1.0/default/CameraModule.cpp b/camera/common/1.0/default/CameraModule.cpp
+index c43a33d..4b9fb8e 100644
+--- a/camera/common/1.0/default/CameraModule.cpp
++++ b/camera/common/1.0/default/CameraModule.cpp
+@@ -48,7 +48,11 @@ void CameraModule::deriveCameraCharacteristicsKeys(
+         chars.update(ANDROID_CONTROL_AWB_LOCK_AVAILABLE, &data, /*count*/1);
+         controlModes.push(ANDROID_CONTROL_MODE_AUTO);
+         camera_metadata_entry entry = chars.find(ANDROID_CONTROL_AVAILABLE_SCENE_MODES);
+-        if (entry.count > 1 || entry.data.u8[0] != ANDROID_CONTROL_SCENE_MODE_DISABLED) {
++        // A HAL that does not publish the key at all used to crash here: an
++        // absent entry has count 0 and data NULL (Meizu M5c, MTK HAL3.2 with
++        // sparse static metadata, provider SIGSEGV on every start).
++        if (entry.count > 1 ||
++            (entry.count == 1 && entry.data.u8[0] != ANDROID_CONTROL_SCENE_MODE_DISABLED)) {
+             controlModes.push(ANDROID_CONTROL_MODE_USE_SCENE_MODE);
+         }
+ 

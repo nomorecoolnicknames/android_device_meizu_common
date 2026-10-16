@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:45:15 +0300
+Subject: [PATCH] SystemUI: null check for the return value of
+ getPackagesForOps()
+
+AppOpsService.getPackagesForOps() returns null when no package has a
+recorded op from AppOpsControllerImpl.OPS, which is the normal state on
+the first boot after a data wipe. fetchCurrentActiveOps() (added by the
+A13 security backport 707fc94ec3df) iterates the result without a check,
+so the first SystemUI start crashes with an NPE while creating
+KeyguardService:
+
+  Unable to create service com.android.systemui.keyguard.KeyguardService:
+  NullPointerException ... List.iterator() on a null object reference
+  at AppOpsControllerImpl.setListening(AppOpsControllerImpl.java:12)
+
+(R8 line 12 of setListening maps to fetchCurrentActiveOps():186.)
+Seen on the Meizu M5c after a clean install of LineageOS 20.
+
+Backport of AOSP Ifc51678733caf412421c5ea1827668b3698e44e0
+("Null check for the return value of getPackagesForOps()", b/324329757),
+present in lineage-21.0 as 42f21d60571b. The test is adapted to A13,
+where setListening() runs synchronously.
+
+Bug: 324329757
+Change-Id: Ifc51678733caf412421c5ea1827668b3698e44e0
+
+diff --git a/packages/SystemUI/src/com/android/systemui/appops/AppOpsControllerImpl.java b/packages/SystemUI/src/com/android/systemui/appops/AppOpsControllerImpl.java
+index 1876786b..8c3ed0b9 100644
+--- a/packages/SystemUI/src/com/android/systemui/appops/AppOpsControllerImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/appops/AppOpsControllerImpl.java
+@@ -183,6 +183,9 @@ public class AppOpsControllerImpl extends BroadcastReceiver implements AppOpsCon
+ 
+     private void fetchCurrentActiveOps() {
+         List<AppOpsManager.PackageOps> packageOps = mAppOps.getPackagesForOps(OPS);
++        if (packageOps == null) {
++            return;
++        }
+         for (AppOpsManager.PackageOps op : packageOps) {
+             for (AppOpsManager.OpEntry entry : op.getOps()) {
+                 for (Map.Entry<String, AppOpsManager.AttributedOpEntry> attributedOpEntry :
+diff --git a/packages/SystemUI/tests/src/com/android/systemui/appops/AppOpsControllerTest.java b/packages/SystemUI/tests/src/com/android/systemui/appops/AppOpsControllerTest.java
+index e6c36c18..cf903d3d 100644
+--- a/packages/SystemUI/tests/src/com/android/systemui/appops/AppOpsControllerTest.java
++++ b/packages/SystemUI/tests/src/com/android/systemui/appops/AppOpsControllerTest.java
+@@ -170,6 +170,16 @@ public class AppOpsControllerTest extends SysuiTestCase {
+         assertThat(mController.getActiveAppOps()).isEmpty();
+     }
+ 
++    /** Regression test for b/324329757 */
++    @Test
++    public void startListening_fetchCurrentActive_nullPackageOps() {
++        when(mAppOpsManager.getPackagesForOps(AppOpsControllerImpl.OPS)).thenReturn(null);
++
++        mController.setListening(true);
++
++        assertThat(mController.getActiveAppOps()).isEmpty();
++    }
++
+     /** Regression test for b/294104969. */
+     @Test
+     public void startListening_fetchesCurrentActive_oneActive() {

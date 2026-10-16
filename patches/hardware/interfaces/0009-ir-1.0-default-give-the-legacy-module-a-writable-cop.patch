@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 18:12:15 +0300
+Subject: [PATCH] ir: 1.0 default: give the legacy module a writable copy of
+ the pattern
+
+pattern.data() points into the received hwbinder buffer, mapped read-only
+in the HAL process. MediaTek's libconsumerir_core.so rewrites the pattern in
+place, so the first transmit on the Meizu MX6 faulted (SEGV_ACCERR in
+signals_generate+740), the HAL died and system_server aborted on the dead
+binder - one IR remote press soft-rebooted the phone.
+
+Test: service call consumer_ir 2 s16 android i32 38000 i32 4
+      i32 9000 i32 4500 i32 560 i32 560 -> Parcel 0, no tombstone,
+      system_server pid unchanged.
+
+Change-Id: Ib93ab7ab13477eceedcd2ef93cf6cdbdfdcd7bea
+
+diff --git a/ir/1.0/default/ConsumerIr.cpp b/ir/1.0/default/ConsumerIr.cpp
+index 69a25cf..821fd7e 100644
+--- a/ir/1.0/default/ConsumerIr.cpp
++++ b/ir/1.0/default/ConsumerIr.cpp
+@@ -16,6 +16,8 @@
+ 
+ #define LOG_TAG "ConsumerIrService"
+ 
++#include <vector>
++
+ #include <log/log.h>
+ 
+ #include <hardware/hardware.h>
+@@ -35,7 +37,13 @@ ConsumerIr::ConsumerIr(consumerir_device_t *device) {
+ 
+ // Methods from ::android::hardware::consumerir::V1_0::IConsumerIr follow.
+ Return<bool> ConsumerIr::transmit(int32_t carrierFreq, const hidl_vec<int32_t>& pattern) {
+-    return mDevice->transmit(mDevice, carrierFreq, pattern.data(), pattern.size()) == 0;
++    // The legacy module gets a private, writable copy. pattern.data() points into
++    // the received hwbinder buffer, which is mapped read-only in this process, and
++    // MediaTek's libconsumerir_core.so (Meizu MX6) rewrites the pattern in place:
++    // signals_generate faulted with SEGV_ACCERR on the first transmit, the HAL died
++    // and system_server aborted on the dead binder (2026-10-06).
++    std::vector<int> copy(pattern.begin(), pattern.end());
++    return mDevice->transmit(mDevice, carrierFreq, copy.data(), copy.size()) == 0;
+ }
+ 
+ Return<void> ConsumerIr::getCarrierFreqs(getCarrierFreqs_cb _hidl_cb) {

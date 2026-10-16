@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 15:06:43 +0300
+Subject: [PATCH] fs_mgr: format f2fs without features when the kernel's f2fs
+ has no feature flags
+
+A kernel whose f2fs predates on-disk feature flags has no
+/sys/fs/f2fs/features (3.18 has no fs/f2fs/sysfs.c; super.c only registers
+the per-device kset). What "make_f2fs -g android -O project_quota,extra_attr"
+produces is not readable there: extra_attr moves the root inode's first data
+address and the old driver reads the old slot. So a wiped, formattable /data
+got an unusable filesystem.
+
+Format such a device with plain make_f2fs; project quota, casefolding and
+compression are unavailable on those kernels anyway. Kernels that have the
+features directory keep the stock arguments.
+
+Seen on the Meizu MX6 (3.18.22 kernel).
+
+Test: after 'fastboot erase userdata', dmesg shows 'formatting ... without
+      -g android and -O' and /data mounts at the full partition size.
+
+Change-Id: I2fcba2f8c3562499d0d3586d724c5e09b83054c7
+
+diff --git a/fs_mgr/fs_mgr_format.cpp b/fs_mgr/fs_mgr_format.cpp
+index 6f59ed3..8b8b950 100644
+--- a/fs_mgr/fs_mgr_format.cpp
++++ b/fs_mgr/fs_mgr_format.cpp
+@@ -129,7 +129,25 @@ static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool needs
+ 
+     std::string size_str = std::to_string(dev_sz / 4096);
+ 
+-    std::vector<const char*> args = {"/system/bin/make_f2fs", "-g", "android"};
++    // An f2fs driver older than on-disk feature flags (no /sys/fs/f2fs/features, e.g. the 3.18
++    // kernels of legacy MediaTek devices) cannot use what "-g android" and "-O ..." produce:
++    // with extra_attr the root inode's first data address moves, and the old driver reads the
++    // old slot. Format such a device without any feature; project quota, casefolding and
++    // compression are unavailable there anyway.
++    const bool legacy_f2fs = access("/sys/fs/f2fs/features", F_OK) != 0;
++    if (legacy_f2fs) {
++        LINFO << "f2fs in this kernel has no feature flags, formatting " << fs_blkdev
++              << " without -g android and -O";
++        needs_projid = false;
++        needs_casefold = false;
++        fs_compress = false;
++    }
++
++    std::vector<const char*> args = {"/system/bin/make_f2fs"};
++    if (!legacy_f2fs) {
++        args.push_back("-g");
++        args.push_back("android");
++    }
+     if (needs_projid) {
+         args.push_back("-O");
+         args.push_back("project_quota,extra_attr");

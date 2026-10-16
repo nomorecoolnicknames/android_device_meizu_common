@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:19:23 +0300
+Subject: [PATCH] fs_mgr: count the legacy f2fs size in 512-byte sectors
+
+make_f2fs reads the size argument in its sector size. "-g android" sets that
+to 4096 (add_default_options: "-d1 -f -w 4096 -R 0:0"), so the stock
+dev_sz / 4096 is right there; without -g android the sector is 512 bytes and
+the same number made an f2fs one eighth of the partition (Meizu MX6: 784000
+4K blocks = 3.2 GB on a 25.7 GB userdata). Keep 512-byte sectors on legacy
+kernels, the geometry verified to mount on 3.18, and pass dev_sz / 512.
+
+Test: after 'fastboot erase userdata', df -h /data shows ~23.9G and the
+      f2fs superblock block_count is 6271992 (0x5FB3F8) or close.
+
+Change-Id: I044b501861877c76b8dccc92e96166c4a1e27d9e
+
+diff --git a/fs_mgr/fs_mgr_format.cpp b/fs_mgr/fs_mgr_format.cpp
+index 8b8b950..b94e5eb 100644
+--- a/fs_mgr/fs_mgr_format.cpp
++++ b/fs_mgr/fs_mgr_format.cpp
+@@ -125,16 +125,22 @@ static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool needs
+         }
+     }
+ 
+-    /* Format the partition using the calculated length */
+-
+-    std::string size_str = std::to_string(dev_sz / 4096);
+-
+     // An f2fs driver older than on-disk feature flags (no /sys/fs/f2fs/features, e.g. the 3.18
+     // kernels of legacy MediaTek devices) cannot use what "-g android" and "-O ..." produce:
+     // with extra_attr the root inode's first data address moves, and the old driver reads the
+     // old slot. Format such a device without any feature; project quota, casefolding and
+     // compression are unavailable there anyway.
+     const bool legacy_f2fs = access("/sys/fs/f2fs/features", F_OK) != 0;
++
++    /* Format the partition using the calculated length */
++
++    // make_f2fs counts the size argument in its sector size: "-g android" sets
++    // that to 4096 (add_default_options: "-d1 -f -w 4096 -R 0:0"), without it
++    // the sector is 512 bytes. Keep 512-byte sectors on legacy kernels -- the
++    // geometry verified to mount on 3.18 -- and count the size in them;
++    // passing 4096-byte units there made an f2fs one eighth of the partition.
++    std::string size_str = std::to_string(dev_sz / (legacy_f2fs ? 512 : 4096));
++
+     if (legacy_f2fs) {
+         LINFO << "f2fs in this kernel has no feature flags, formatting " << fs_blkdev
+               << " without -g android and -O";

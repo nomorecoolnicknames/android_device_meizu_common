@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 05:55:39 +0300
+Subject: [PATCH] linkerconfig: sphal: also link libnetutils.so for legacy MTK
+ Mali drivers
+
+libbwc of the MT6735/MT6753/MT6755 Mali-T720/T860 stacks needs
+libnetutils.so, which is VNDK-core and not visible in sphal.
+libutilscallstack.so is not added: it is VNDK-SP and already reachable.
+libui.so is deliberately not added: the Nougat Mali driver reads Region
+fields in the Nougat layout, and the platform Region (FatVector) crashed
+HWUI, so Region has to come from a vendor shim with that layout.
+A no-op on the MX6, whose own copy sits in the sphal search paths ahead
+of the link.
+
+Change-Id: Ib65c10631fb33d397b42c060ff77185126a4a09f
+
+diff --git a/contents/namespace/sphal.cc b/contents/namespace/sphal.cc
+index efbf4a0..9f4a2fe 100644
+--- a/contents/namespace/sphal.cc
++++ b/contents/namespace/sphal.cc
+@@ -89,6 +89,20 @@ Namespace BuildSphalNamespace([[maybe_unused]] const Context& ctx) {
+     // Without it SurfaceFlinger and zygote cannot load EGL. Expose exactly
+     // libbinder.so; the rest of VNDK-core stays out of sphal.
+     ns.GetLink("vndk").AddSharedLib("libbinder.so");
++    // Same closure on the MT6735/MT6753/MT6755 fleet (Mali-T720/T860): libbwc
++    // NEEDs libnetutils.so (VNDK-core, plain C API). A vendor copy in sphal's
++    // own search paths still wins over the link, so devices that ship one
++    // (m95) are unaffected.
++    // Not needed here: libutilscallstack.so (android::CallStack) is VNDK-SP
++    // and already reachable through VNDK_SAMEPROCESS_LIBRARIES_VENDOR above; a
++    // blob that imports CallStack without NEEDing it needs a DT_NEEDED patch,
++    // not a link.
++    // Deliberately NOT libui.so: N-era Mali reads android::Region fields with
++    // the Nougat layout (Vector<Rect>, 32 bytes) while A10+ Region is a
++    // FatVector (~90 bytes) -- linking the platform libui crashed every HWUI
++    // process on m95 (device/meizu/m95/shims/region.cpp). Region has to come
++    // from a vendor shim with the N layout instead.
++    ns.GetLink("vndk").AddSharedLib("libnetutils.so");
+     ns.AddRequires(std::vector{"libneuralnetworks.so"});
+   }
+ 

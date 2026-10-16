@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 18:36:57 +0300
+Subject: [PATCH] VintfObject: let legacy-kernel devices skip the RuntimeInfo
+ check at boot
+
+Build.isBuildConsistent() runs verifyWithoutAvb(), which includes the kernel
+check. A kernel older than every entry of the framework compatibility matrices
+(Meizu MX6: 3.18 vs 4.4+ at FCM 3) fails it on every boot with "No kernel entry
+found for kernel version 3.18", and ActivityTaskManager shows the "internal
+problem with your device" dialog. Devices that ship such a kernel set
+ro.vendor.vintf.legacy_kernel=true; HAL and manifest checks stay enabled.
+
+Change-Id: I52a58d8ae0a5bcf9c594d3222013bc1f9ebbcfca
+
+diff --git a/core/jni/android_os_VintfObject.cpp b/core/jni/android_os_VintfObject.cpp
+index 1baea2ae..630c4c50 100644
+--- a/core/jni/android_os_VintfObject.cpp
++++ b/core/jni/android_os_VintfObject.cpp
+@@ -17,6 +17,7 @@
+ #define LOG_TAG "VintfObject"
+ //#define LOG_NDEBUG 0
+ #include <android-base/logging.h>
++#include <android-base/properties.h>
+ 
+ #include <vector>
+ #include <string>
+@@ -95,8 +96,17 @@ static jobjectArray android_os_VintfObject_report(JNIEnv* env, jclass)
+ 
+ static jint android_os_VintfObject_verifyWithoutAvb(JNIEnv* env, jclass) {
+     std::string error;
+-    int32_t status = VintfObject::GetInstance()->checkCompatibility(&error,
+-            ::android::vintf::CheckFlags::DISABLE_AVB_CHECK);
++    auto flags = ::android::vintf::CheckFlags::DISABLE_AVB_CHECK;
++    // A legacy kernel older than every kernel entry of the framework
++    // compatibility matrices (Meizu MX6: 3.18 against the 4.4+ of FCM 3) fails
++    // the RuntimeInfo check on every boot -- "No kernel entry found for kernel
++    // version 3.18" -- and raises the "internal problem with your device"
++    // dialog. A device that ships such a kernel declares it; the HAL and
++    // manifest checks stay on.
++    if (android::base::GetBoolProperty("ro.vendor.vintf.legacy_kernel", false)) {
++        flags = flags.disableRuntimeInfo();
++    }
++    int32_t status = VintfObject::GetInstance()->checkCompatibility(&error, flags);
+     if (status)
+         LOG(WARNING) << "VintfObject.verifyWithoutAvb() returns " << status << ": " << error;
+     return status;

@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 14:35:06 +0300
+Subject: [PATCH] BandwidthController: skip pinned xt_bpf rules when the kernel
+ lacks revision 1
+
+Vendor 3.18 kernels register xt_bpf revision 0 only. iptables then falls
+back to that revision, rejects "-m bpf --object-pinned" as an unknown option
+and the whole basic accounting restore fails. Controllers::init() treats
+that as fatal and exits, and netd's "onrestart restart zygote" turns it into
+a boot loop.
+
+Ask the kernel whether bpf revision 1 exists, the same way iptables does
+before it picks a match revision, and leave the four pinned-program rules
+out when it does not. Any other failure stays fatal, and kernels that have
+revision 1 get the unchanged rule set.
+
+Lost on such kernels: the xt_bpf interface byte counters (iface_stats_map)
+and the metered-network penalty box and happy box. Without revision 1 the
+kernel could not run those programs from iptables anyway.
+
+Seen on the Meizu MX6 (3.18.22 kernel): net/netfilter/xt_bpf.c registers
+revision 0 only.
+
+Test: BandwidthControllerTest updated; netd_unit_test was not run.
+
+Change-Id: Id17dfe8d742aaee0be68c97aa29fd67a1a7ef20f
+
+diff --git a/server/BandwidthController.cpp b/server/BandwidthController.cpp
+index 8dba75a..c70189c 100644
+--- a/server/BandwidthController.cpp
++++ b/server/BandwidthController.cpp
+@@ -28,12 +28,14 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <algorithm>
+ #include <string>
+ #include <vector>
+ 
+ #define __STDC_FORMAT_MACROS 1
+ #include <inttypes.h>
+ 
++#include <netinet/in.h>
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -42,9 +44,12 @@
+ #include <linux/netlink.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/pkt_sched.h>
++#include <linux/netfilter/x_tables.h>
++#include <linux/netfilter_ipv4/ip_tables.h>
+ 
+ #include "android-base/stringprintf.h"
+ #include "android-base/strings.h"
++#include "android-base/unique_fd.h"
+ #define LOG_TAG "BandwidthController"
+ #include <cutils/properties.h>
+ #include <log/log.h>
+@@ -258,8 +263,30 @@ std::vector<std::string> getBasicAccountingCommands() {
+     return ipt_basic_accounting_commands;
+ }
+ 
++// Whether the kernel has revision 1 of the xt_bpf match, which "-m bpf --object-pinned" needs.
++// Linux added it in 4.10 and Android's 4.9 kernels carry it, but 3.18 vendor kernels (the Meizu
++// MX6, for one) only have revision 0, which takes inline classic BPF. There iptables falls back
++// to revision 0, rejects --object-pinned as an unknown option and fails the whole restore.
++// Ask the kernel the question iptables itself asks before it picks a match revision
++// (xtables_compatible_revision() in libxtables). xt_bpf is family-agnostic, so the IPv4 answer
++// holds for ip6tables too. Anything short of a clear "no" keeps the stock behaviour.
++bool kernelHasXtBpfPinned() {
++    android::base::unique_fd s(socket(AF_INET, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_RAW));
++    if (!s.ok()) return true;
++
++    xt_get_revision rev = {.name = "bpf", .revision = 1};
++    socklen_t len = sizeof(rev);
++    if (getsockopt(s.get(), IPPROTO_IP, IPT_SO_GET_REVISION_MATCH, &rev, &len) != -1) return true;
++
++    // Same errno set that makes iptables treat a revision as unsupported.
++    const int err = errno;
++    return err != ENOENT && err != EPROTONOSUPPORT && err != ENOPROTOOPT;
++}
++
+ }  // namespace
+ 
++auto BandwidthController::kernelHasXtBpfPinnedFunction = kernelHasXtBpfPinned;
++
+ BandwidthController::BandwidthController() {
+ }
+ 
+@@ -286,7 +313,23 @@ int BandwidthController::enableBandwidthControl() {
+ 
+     flushCleanTables(false);
+ 
+-    std::string commands = Join(getBasicAccountingCommands(), '\n');
++    std::vector<std::string> cmds = getBasicAccountingCommands();
++    if (!kernelHasXtBpfPinnedFunction()) {
++        // A single rule iptables cannot parse fails the whole restore; netd then exits and init
++        // restarts zygote with it, in a loop. Leave the pinned-program rules out instead: without
++        // xt_bpf revision 1 the kernel cannot run those programs from iptables anyway.
++        const size_t total = cmds.size();
++        cmds.erase(std::remove_if(cmds.begin(), cmds.end(),
++                                  [](const std::string& cmd) {
++                                      return cmd.find("--object-pinned") != std::string::npos;
++                                  }),
++                   cmds.end());
++        ALOGW("Kernel lacks xt_bpf revision 1, skipped %zu -m bpf --object-pinned rules: "
++              "no interface stats, penalty box or happy box",
++              total - cmds.size());
++    }
++
++    std::string commands = Join(cmds, '\n');
+     return iptablesRestoreFunction(V4V6, commands, nullptr);
+ }
+ 
+diff --git a/server/BandwidthController.h b/server/BandwidthController.h
+index 2a3b4bd..ca8fea8 100644
+--- a/server/BandwidthController.h
++++ b/server/BandwidthController.h
+@@ -118,6 +118,7 @@ public:
+     static int (*execFunction)(int, char **, int *, bool, bool);
+     static FILE *(*popenFunction)(const char *, const char *);
+     static int (*iptablesRestoreFunction)(IptablesTarget, const std::string&, std::string *);
++    static bool (*kernelHasXtBpfPinnedFunction)();
+ 
+     static const char *opToString(IptOp op);
+     static const char *jumpToString(IptJumpOp jumpHandling);
+diff --git a/server/BandwidthControllerTest.cpp b/server/BandwidthControllerTest.cpp
+index 844681d..4764395 100644
+--- a/server/BandwidthControllerTest.cpp
++++ b/server/BandwidthControllerTest.cpp
+@@ -53,6 +53,7 @@ class BandwidthControllerTest : public IptablesBaseTest {
+ protected:
+     BandwidthControllerTest() {
+         BandwidthController::iptablesRestoreFunction = fakeExecIptablesRestoreWithOutput;
++        BandwidthController::kernelHasXtBpfPinnedFunction = [] { return true; };
+     }
+     BandwidthController mBw;
+     TunInterface mTun;
+@@ -114,6 +115,11 @@ protected:
+ 
+     int removeCostlyAlert(const std::string& a, int64_t* b) { return mBw.removeCostlyAlert(a, b); }
+ 
++    // Kernels without xt_bpf revision 1 (e.g. 3.18) cannot take "-m bpf --object-pinned".
++    void simulateKernelWithoutXtBpfPinned() {
++        BandwidthController::kernelHasXtBpfPinnedFunction = [] { return false; };
++    }
++
+     void expectUpdateQuota(uint64_t quota) {
+         uintptr_t dummy;
+         FILE* dummyFile = reinterpret_cast<FILE*>(&dummy);
+@@ -204,6 +210,44 @@ TEST_F(BandwidthControllerTest, TestEnableBandwidthControl) {
+     expectSetupCommands(expectedClean, expectedAccounting);
+ }
+ 
++TEST_F(BandwidthControllerTest, TestEnableBandwidthControlWithoutXtBpfPinned) {
++    simulateKernelWithoutXtBpfPinned();
++
++    addIptablesRestoreOutput(
++            "-P OUTPUT ACCEPT\n"
++            "-N bw_costly_shared\n"
++            "-N unrelated\n");
++
++    // Same as TestEnableBandwidthControl minus the four pinned-program rules.
++    // clang-format off
++    static const std::string expectedAccounting =
++            "*filter\n"
++            "-A bw_INPUT -j bw_global_alert\n"
++            "-A bw_INPUT -p esp -j RETURN\n"
++            "-A bw_INPUT -m mark --mark 0x100000/0x100000 -j RETURN\n"
++            "-A bw_INPUT -j MARK --or-mark 0x100000\n"
++            "-A bw_OUTPUT -j bw_global_alert\n"
++            "-A bw_costly_shared -j bw_penalty_box\n"
++            "-A bw_penalty_box -j bw_happy_box\n"
++            "-A bw_happy_box -j bw_data_saver\n"
++            "-A bw_data_saver -j RETURN\n"
++            "COMMIT\n"
++            "*raw\n"
++            "-A bw_raw_PREROUTING -m mark --mark 0xdeadc1a7 -j DROP\n"
++            "-A bw_raw_PREROUTING -i ipsec+ -j RETURN\n"
++            "-A bw_raw_PREROUTING -m policy --pol ipsec --dir in -j RETURN\n"
++            "COMMIT\n"
++            "*mangle\n"
++            "-A bw_mangle_POSTROUTING -o ipsec+ -j RETURN\n"
++            "-A bw_mangle_POSTROUTING -m policy --pol ipsec --dir out -j RETURN\n"
++            "-A bw_mangle_POSTROUTING -j MARK --set-mark 0x0/0x100000\n"
++            "COMMIT\n";
++    // clang-format on
++
++    EXPECT_EQ(0, mBw.enableBandwidthControl());
++    expectSetupCommands("", expectedAccounting);
++}
++
+ TEST_F(BandwidthControllerTest, TestDisableBandwidthControl) {
+     // Pretend some bw_costly_shared_<iface> rules already exist...
+     addIptablesRestoreOutput(

@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 16:33:29 +0300
+Subject: [PATCH] audio: drop empty-valued stream parameters for a Nougat HAL
+ input
+
+Since Android 9 the audio policy gives a built-in mic without an
+address the address "bottom" (AUDIO_BOTTOM_MICROPHONE_ADDRESS, "back"
+for the back mic). A HAL without audio patches is routed through
+set_parameters, where the device address becomes a bare key:
+"bottom=;input_source=1;routing=-2147483644". A Nougat HAL never got
+such a key; the MediaTek one of the Meizu M5c keeps it as unconsumed
+("remain param = bottom=") and fails set_parameters, so the input patch
+is not created and AudioFlinger's startInput returns BAD_VALUE: no
+recording at all.
+
+Input streams of a device marked ro.vendor.audio.legacy_nougat_abi
+(Device::hasNougatAbi()) now drop keys with an empty value before
+calling the HAL; everything else is passed on unchanged. Other devices
+and output streams are not affected.
+
+Change-Id: I1d547a7be6c35b6f7423dd584b8657ce7d3f2ff7
+
+diff --git a/audio/core/all-versions/default/Stream.cpp b/audio/core/all-versions/default/Stream.cpp
+index 8e85a8b..2c3b2f3 100644
+--- a/audio/core/all-versions/default/Stream.cpp
++++ b/audio/core/all-versions/default/Stream.cpp
+@@ -44,7 +44,8 @@ namespace util {
+ using namespace ::android::hardware::audio::CORE_TYPES_CPP_VERSION::implementation::util;
+ }
+ 
+-Stream::Stream(bool isInput, audio_stream_t* stream) : mIsInput(isInput), mStream(stream) {
++Stream::Stream(bool isInput, audio_stream_t* stream, bool dropEmptyParameters)
++    : mIsInput(isInput), mStream(stream), mDropEmptyParameters(dropEmptyParameters) {
+     (void)mIsInput;  // prevent 'unused field' warnings in pre-V7 versions.
+ }
+ 
+@@ -68,6 +69,24 @@ char* Stream::halGetParameters(const char* keys) {
+ }
+ 
+ int Stream::halSetParameters(const char* keysAndValues) {
++    if (mDropEmptyParameters) {
++        // Since Android 9 the policy gives a built-in mic without an address the address
++        // "bottom" (AUDIO_BOTTOM_MICROPHONE_ADDRESS; "back" for the back mic), and a HAL
++        // without audio patches is routed with the device address as a bare key:
++        // "bottom=;input_source=1;routing=-2147483644". A Nougat HAL never saw such a key; the
++        // MTK one keeps it as unconsumed and fails set_parameters(), so the input patch is
++        // not created and startInput() returns BAD_VALUE (m5c, 2026-09-29). Drop keys that
++        // carry no value; everything else is passed on as is.
++        AudioParameter params{String8(keysAndValues)};
++        String8 key, value;
++        for (size_t i = params.size(); i > 0; --i) {
++            if (params.getAt(i - 1, key, value) == OK && value.isEmpty()) {
++                ALOGV("%s: dropping \"%s=\" for the Nougat HAL", __func__, key.string());
++                params.remove(key);
++            }
++        }
++        return mStream->set_parameters(mStream, params.toString().string());
++    }
+     return mStream->set_parameters(mStream, keysAndValues);
+ }
+ 
+diff --git a/audio/core/all-versions/default/StreamIn.cpp b/audio/core/all-versions/default/StreamIn.cpp
+index 09043d5..e1e164c 100644
+--- a/audio/core/all-versions/default/StreamIn.cpp
++++ b/audio/core/all-versions/default/StreamIn.cpp
+@@ -148,7 +148,8 @@ bool ReadThread::threadLoop() {
+ StreamIn::StreamIn(const sp<Device>& device, audio_stream_in_t* stream)
+     : mDevice(device),
+       mStream(stream),
+-      mStreamCommon(new Stream(true /*isInput*/, &stream->common)),
++      mStreamCommon(new Stream(true /*isInput*/, &stream->common,
++                               device->hasNougatAbi() /*dropEmptyParameters*/)),
+       mStreamMmap(new StreamMmap<audio_stream_in_t>(stream)),
+       mEfGroup(nullptr),
+       mStopReadThread(false) {}
+diff --git a/audio/core/all-versions/default/include/core/default/Stream.h b/audio/core/all-versions/default/include/core/default/Stream.h
+index 4e79884..a651824 100644
+--- a/audio/core/all-versions/default/include/core/default/Stream.h
++++ b/audio/core/all-versions/default/include/core/default/Stream.h
+@@ -53,7 +53,9 @@ using namespace ::android::hardware::audio::CORE_TYPES_CPP_VERSION;
+ using namespace ::android::hardware::audio::CPP_VERSION;
+ 
+ struct Stream : public IStream, public ParametersUtil {
+-    Stream(bool isInput, audio_stream_t* stream);
++    // dropEmptyParameters: drop "key=" entries (empty value) before set_parameters(), see
++    // halSetParameters().  StreamIn sets it for a Nougat HAL (Device::hasNougatAbi()).
++    Stream(bool isInput, audio_stream_t* stream, bool dropEmptyParameters = false);
+ 
+     /** 1GiB is the maximum buffer size the HAL client is allowed to request.
+      * This value has been chosen to be under SIZE_MAX and still big enough
+@@ -124,6 +126,7 @@ struct Stream : public IStream, public ParametersUtil {
+    private:
+      const bool mIsInput;
+      audio_stream_t* mStream;
++     const bool mDropEmptyParameters;
+ 
+      virtual ~Stream();
+ 

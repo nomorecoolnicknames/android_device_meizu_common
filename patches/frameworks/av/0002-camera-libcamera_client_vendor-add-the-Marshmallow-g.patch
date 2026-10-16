@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 16:12:05 +0300
+Subject: [PATCH] camera: libcamera_client_vendor: add the Marshmallow
+ getCameraInfo()
+
+libsource.so of the Meizu M5s and M2 Note (MT6753, both bitnesses) imports
+CameraBase<Camera>::getCameraInfo(int, android::CameraInfo*), the form from
+before CameraInfo moved into android::hardware. Its caller passes an
+8-byte stack slot and reads facing at +0 and orientation at +4, so the
+slot cannot be handed on as a hardware::CameraInfo (vptr first). Fill a
+plain {int facing; int orientation;} from the Android 13 call instead.
+
+Change-Id: Iacc2d6d14620fe52e5d33f33069b82ae3ada6120
+
+diff --git a/camera/Android.bp b/camera/Android.bp
+index 90bc7b2..0541603 100644
+--- a/camera/Android.bp
++++ b/camera/Android.bp
+@@ -127,8 +127,9 @@ cc_library_shared {
+ // (Meizu MX6: the Nougat MediaTek HAL1 stack, 21 libraries). Same sources,
+ // linked against libgui_vendor; the platform-compat AIDL client is compiled in
+ // because lib-platform-compat-native-api is system-only.
+-// VendorLegacyCompat.cpp restores the two entry points those blobs import
+-// that Android 13 changed or removed.
++// VendorLegacyCompat.cpp restores the entry points those blobs import that
++// Android 13 changed or removed, plus the Marshmallow getCameraInfo form that
++// libsource.so of the Meizu M5s and M2 Note (MT6753) imports.
+ cc_library_shared {
+     name: "libcamera_client_vendor",
+     stem: "libcamera_client",
+diff --git a/camera/VendorLegacyCompat.cpp b/camera/VendorLegacyCompat.cpp
+index 6f36158..1c5a228 100644
+--- a/camera/VendorLegacyCompat.cpp
++++ b/camera/VendorLegacyCompat.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Entry points that legacy (Nougat) vendor camera HALs import from
++ * Entry points that legacy (Marshmallow/Nougat) vendor camera HALs import from
+  * libcamera_client and that Android 13 changed or removed. Built only into the
+  * vendor copy, libcamera_client_vendor (stem libcamera_client).
+  */
+@@ -22,6 +22,33 @@ status_t _ZN7android10CameraBaseINS_6CameraENS_12CameraTraitsIS1_EEE13getCameraI
+     return CameraBase<Camera>::getCameraInfo(cameraId, /*overrideToPortrait*/ false, cameraInfo);
+ }
+ 
++// static status_t CameraBase<Camera>::getCameraInfo(int, CameraInfo*): the
++// Marshmallow form, from before CameraInfo moved into android::hardware and
++// became a Parcelable.  The M struct is a plain {int facing; int orientation;}
++// with no vtable, so the caller's 8-byte buffer cannot be handed on as a
++// hardware::CameraInfo (which starts with a vptr): the fields would land 8
++// bytes off and the write would run past the buffer.  Imported by libsource.so
++// of the Meizu M5s and M2 Note (MT6753); its caller reads facing at +0 and
++// orientation at +4 of an 8-byte stack slot (llvm-objdump,
++// Source::setCameraAfterConnect: lib64/libsource.so m5s 0xf25c-0xf284,
++// m2note 0xe564-0xe590; lib/libsource.so, sp+36 and sp+40, m5s 0xe1ae-0xe1ce,
++// m2note 0xd6a6-0xd6c4).
++struct LegacyCameraInfoM {
++    int facing;
++    int orientation;
++};
++
++status_t _ZN7android10CameraBaseINS_6CameraENS_12CameraTraitsIS1_EEE13getCameraInfoEiPNS_10CameraInfoE(
++        int cameraId, LegacyCameraInfoM* cameraInfo) {
++    android::hardware::CameraInfo info;
++    status_t res = CameraBase<Camera>::getCameraInfo(cameraId, /*overrideToPortrait*/ false, &info);
++    if (res == android::OK && cameraInfo != nullptr) {
++        cameraInfo->facing = info.facing;
++        cameraInfo->orientation = info.orientation;
++    }
++    return res;
++}
++
+ // static status_t Camera::connectLegacy(int, int, const String16&, int, sp<Camera>&):
+ // removed in Android 10 together with HAL1 connections through cameraservice.
+ // Only the video-telephony libraries of the Meizu MX6 import it.

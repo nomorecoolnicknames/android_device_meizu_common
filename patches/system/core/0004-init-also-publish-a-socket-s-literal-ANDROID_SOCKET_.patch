@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 18:18:14 +0300
+Subject: [PATCH] init: also publish a socket's literal ANDROID_SOCKET_ name
+
+Descriptor::Publish() only sets the mangled name (non-alphanumerics become
+'_'). Vendor daemons built against Nougat build ANDROID_SOCKET_<name> from
+the literal socket name and call getenv, so every hyphenated socket -- on
+the Meizu MX6 the MediaTek RIL side bus: rild-ims, rild-oem, rild-mal-at and
+others -- is invisible to them. Publish the literal name too when it
+differs.
+
+Change-Id: I40dee832011b3216e0d9ccc45636e8719577f404
+
+diff --git a/init/service_utils.cpp b/init/service_utils.cpp
+index d19f5ee..1cf1196 100644
+--- a/init/service_utils.cpp
++++ b/init/service_utils.cpp
+@@ -164,6 +164,18 @@ void Descriptor::Publish() const {
+ 
+     std::string val = std::to_string(fd);
+     setenv(published_name.c_str(), val.c_str(), 1);
++
++    // Vendor daemons built against Nougat find their descriptor by the socket's
++    // literal name: they build ANDROID_SOCKET_<name> themselves and call getenv
++    // instead of android_get_control_socket(), which applies the same mangling as
++    // the loop above. Nougat's init did not mangle, so every socket whose name
++    // holds a hyphen -- on the Meizu MX6 the whole MediaTek RIL side bus,
++    // rild-ims, rild-oem, rild-mal-at and others -- is invisible to them: they log
++    // a failure to acquire the socket and never listen. Publish the literal name
++    // alongside when the two differ; nothing else reads it.
++    if (name_ != published_name) {
++        setenv(name_.c_str(), val.c_str(), 1);
++    }
+ }
+ 
+ Result<Descriptor> SocketDescriptor::Create(const std::string& global_context) const {

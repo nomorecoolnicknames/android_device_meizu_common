@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:04:57 +0300
+Subject: [PATCH] gd: hci: keep the pages read when a later extended-features
+ page fails
+
+Some controllers announce a maximum page of Read Local Extended Features
+that they cannot read. The MediaTek CONSYS Bluetooth 4.0 core of the Meizu
+M5c (MT6737M, local name "MTK MT0335", HCI version 6) answers:
+
+  Read Local Extended Features page 0 -> success, maximum page 2
+  Read Local Extended Features page 1 -> success, maximum page 2
+  Read Local Extended Features page 2 -> 0x30 Parameter Out Of Mandatory Range
+
+and Controller::impl::read_local_extended_features_complete_handler()
+turned that into an abort of com.android.bluetooth on every enable:
+
+  assertion 'status == ErrorCode::SUCCESS' failed - Status 0x30
+
+Keep the pages already read and finish the start-up. A controller that
+fails page 0 still aborts as before.
+
+Change-Id: I2c72ddc0ab8391e58c8b3468c23acb3385a0b968
+
+diff --git a/system/gd/hci/controller.cc b/system/gd/hci/controller.cc
+index 10023e3..a4bddaf 100644
+--- a/system/gd/hci/controller.cc
++++ b/system/gd/hci/controller.cc
+@@ -280,6 +280,18 @@ struct Controller::impl {
+     auto complete_view = ReadLocalExtendedFeaturesCompleteView::Create(view);
+     ASSERT(complete_view.IsValid());
+     ErrorCode status = complete_view.GetStatus();
++    // Some controllers announce a maximum page they cannot read.  The MediaTek
++    // CONSYS Bluetooth 4.0 core of the Meizu M5c ("MTK MT0335") answers pages
++    // 0 and 1 with maximum page 2, and page 2 with 0x30 (Parameter Out Of
++    // Mandatory Range).  Keep the pages already read instead of aborting the
++    // stack; a controller that cannot even give page 0 still aborts.
++    if (status != ErrorCode::SUCCESS && !extended_lmp_features_array_.empty()) {
++      LOG_WARN("Read Local Extended Features page %zu failed: %s; using the first %zu page(s)",
++               extended_lmp_features_array_.size(), ErrorCodeText(status).c_str(),
++               extended_lmp_features_array_.size());
++      promise.set_value();
++      return;
++    }
+     ASSERT_LOG(status == ErrorCode::SUCCESS, "Status 0x%02hhx, %s", status, ErrorCodeText(status).c_str());
+     uint8_t page_number = complete_view.GetPageNumber();
+     extended_lmp_features_array_.push_back(complete_view.GetExtendedLmpFeatures());

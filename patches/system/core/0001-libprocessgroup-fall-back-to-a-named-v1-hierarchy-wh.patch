@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 12:19:23 +0300
+Subject: [PATCH] libprocessgroup: fall back to a named v1 hierarchy when
+ cgroup2 is missing
+
+Kernels older than 4.5 have no cgroup2 filesystem. On them the mount fails
+with ENODEV, /sys/fs/cgroup stays a bare sysfs directory, mkdir uid_0
+returns EPERM and init cannot start any service (createProcessGroup failed
+-> bootstrap-apexd-failed). The uid/pid process-group hierarchy only needs
+mkdir/rmdir and cgroup.procs, which a controller-less named v1 hierarchy
+provides.
+
+Seen on the Meizu MX6 (3.18.22 kernel).
+
+Change-Id: I467450b592aefa2ce4d0bdd3f89920c58f0c79d6
+
+diff --git a/libprocessgroup/setup/cgroup_map_write.cpp b/libprocessgroup/setup/cgroup_map_write.cpp
+index 3831ef2..3b231c0 100644
+--- a/libprocessgroup/setup/cgroup_map_write.cpp
++++ b/libprocessgroup/setup/cgroup_map_write.cpp
+@@ -278,6 +278,18 @@ static bool SetupCgroup(const CgroupDescriptor& descriptor) {
+                 if (mount("none", controller->path(), "cgroup2", MS_NODEV | MS_NOEXEC | MS_NOSUID,
+                           nullptr) < 0) {
+                     PLOG(ERROR) << "Failed to mount cgroup v2";
++                    // Legacy kernels (< 4.5) have no cgroup2 filesystem. The uid/pid process
++                    // group hierarchy only needs mkdir/rmdir and cgroup.procs, which a
++                    // controller-less named v1 hierarchy provides. Without it no service can
++                    // be started (createProcessGroup fails with EPERM on the bare sysfs dir).
++                    if (errno == ENODEV &&
++                        mount("none", controller->path(), "cgroup",
++                              MS_NODEV | MS_NOEXEC | MS_NOSUID, "none,name=android_pg") < 0) {
++                        PLOG(ERROR) << "Failed to mount v1 fallback for cgroup v2";
++                    } else if (errno == ENODEV) {
++                        LOG(INFO) << "Mounted named v1 hierarchy at " << controller->path()
++                                  << " in place of cgroup v2";
++                    }
+                 }
+             }
+ 

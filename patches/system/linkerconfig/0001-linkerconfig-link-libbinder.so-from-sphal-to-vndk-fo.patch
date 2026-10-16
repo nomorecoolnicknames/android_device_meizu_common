@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 14:40:43 +0300
+Subject: [PATCH] linkerconfig: link libbinder.so from sphal to vndk for legacy
+ MTK GPU drivers
+
+Nougat-era MediaTek GPU drivers carry libbinder.so in their closure (on the
+Meizu MX6: libGLES_mali, libged, libdpframework, libpqservice, libbwc).
+libbinder is VNDK-core, and the sphal namespace links to vndk for VNDK-SP
+only, so SurfaceFlinger and zygote cannot load EGL:
+
+  library "libbinder.so" not found: needed by
+  /vendor/lib64/egl/libGLES_mali.so in namespace sphal
+
+The device-side workaround, a copy of an older libbinder in /vendor/${LIB},
+breaks on a VNDK 33 vendor. The vendor default namespace searches
+/vendor/${LIB} before its vndk link, so every vendor process picks the copy.
+The v30 copy imports thread_store_get/set, which the v33 libcutils no longer
+exports, and A13-built vendor code needs libbinder symbols v30 does not have.
+
+Expose exactly libbinder.so on the sphal -> vndk link; the rest of VNDK-core
+stays out of sphal. testdata/golden_output is not regenerated (that needs a
+host build), so the linkerconfig diff test will report the extra entry.
+
+Change-Id: I108681b2260068e7cf4bfb294e29f7b045613800
+
+diff --git a/contents/namespace/sphal.cc b/contents/namespace/sphal.cc
+index 8a6e99e..efbf4a0 100644
+--- a/contents/namespace/sphal.cc
++++ b/contents/namespace/sphal.cc
+@@ -83,6 +83,12 @@ Namespace BuildSphalNamespace([[maybe_unused]] const Context& ctx) {
+         .AddSharedLib(Var("LLNDK_LIBRARIES_VENDOR", ""));
+     ns.GetLink("vndk").AddSharedLib(
+         Var("VNDK_SAMEPROCESS_LIBRARIES_VENDOR", ""));
++    // Legacy MediaTek vendors (Nougat blobs on a VNDK 33 vendor): the GPU
++    // driver closure (libGLES_mali, libged, libdpframework, libpqservice,
++    // libbwc) NEEDs libbinder.so, which is VNDK-core and so not visible here.
++    // Without it SurfaceFlinger and zygote cannot load EGL. Expose exactly
++    // libbinder.so; the rest of VNDK-core stays out of sphal.
++    ns.GetLink("vndk").AddSharedLib("libbinder.so");
+     ns.AddRequires(std::vector{"libneuralnetworks.so"});
+   }
+ 

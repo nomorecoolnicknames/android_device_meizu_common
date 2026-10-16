@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 18:31:34 +0300
+Subject: [PATCH] camera: device@3.3: let persist.camera.raw_maxbuf raise RAW16
+ maxBuffers
+
+MediaTek's HAL3 on the Meizu MX6 answers max_buffers = 1 for a RAW16
+output. Google Camera puts preview + RAW16 4032x3016 in every ZSL request,
+so only one request can be in flight: 3 fps while the sensor delivers
+16.6 fps and the CPUs are ~80 % idle. persist.camera.raw_maxbuf=N (2..8)
+advertises N to the framework instead of the HAL's 1; unset, nothing
+changes.
+
+Test: setprop persist.camera.raw_maxbuf 4; restart Google Camera;
+      dumpsys media.camera shows RAW16 'max HAL buffers: 4'; no provider
+      crash.
+
+Change-Id: I61337c0c54e8c112cb5fd846d9fb15e649d21507
+
+diff --git a/camera/device/3.3/default/convert.cpp b/camera/device/3.3/default/convert.cpp
+index 9b6caf0..ffbb1f1 100644
+--- a/camera/device/3.3/default/convert.cpp
++++ b/camera/device/3.3/default/convert.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #define LOG_TAG "android.hardware.camera.device@3.3-convert-impl"
++#include <cutils/properties.h>
+ #include <log/log.h>
+ 
+ #include "include/convert.h"
+@@ -35,6 +36,21 @@ void convertToHidl(const Camera3Stream* src, HalStream* dst) {
+     dst->v3_2.id = src->mId;
+     dst->v3_2.overrideFormat = (PixelFormat) src->format;
+     dst->v3_2.maxBuffers = src->max_buffers;
++    // Off unless set (Meizu MX6): the MediaTek
++    // HAL3 answers max_buffers = 1 for a RAW16 output, so with Google Camera's
++    // ZSL request (preview + RAW16 4032x3016 on every frame) only one request
++    // can be in flight and the session runs at 3 fps while the sensor delivers
++    // 16.6 and the CPUs sit idle. persist.camera.raw_maxbuf=N
++    // advertises N to the framework instead; whether the HAL really copes with
++    // N RAW buffers outstanding is exactly what the experiment measures.
++    if (src->format == HAL_PIXEL_FORMAT_RAW16) {
++        int32_t want = property_get_int32("persist.camera.raw_maxbuf", 0);
++        if (want > (int32_t)src->max_buffers && want <= 8) {
++            ALOGI("%s: RAW16 stream %d maxBuffers %u -> %d (persist.camera.raw_maxbuf)",
++                  __FUNCTION__, src->mId, src->max_buffers, want);
++            dst->v3_2.maxBuffers = want;
++        }
++    }
+     if (src->stream_type == CAMERA3_STREAM_OUTPUT) {
+         dst->v3_2.consumerUsage = (BufferUsageFlags)0;
+         dst->v3_2.producerUsage = (BufferUsageFlags)src->usage;

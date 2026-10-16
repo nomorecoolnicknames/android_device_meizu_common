@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nomorecoolnicknames <nomorecoolnicknames@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 17:54:16 +0300
+Subject: [PATCH] camera: provider@2.4 service: ignore SIGPIPE
+
+A dumpsys reader that closes its end early (dumpsys media.camera | grep -m1)
+made the HAL's dump write() raise SIGPIPE; init then restarted the whole
+provider and every open camera was lost (Meizu MX6: 'Service
+vendor.camera-provider-2-4 (pid 483) received signal 13'). With SIGPIPE
+ignored the write fails with EPIPE and the provider keeps running.
+
+Test: with a camera open, 'dumpsys media.camera | head -1' leaves the
+      provider pid unchanged and no 'received signal 13' in dmesg.
+
+Change-Id: I3e96e4f77eedf20711e73a9a0a52f6b19a13def6
+
+diff --git a/camera/provider/2.4/default/service.cpp b/camera/provider/2.4/default/service.cpp
+index 0a4f787..52201f5 100644
+--- a/camera/provider/2.4/default/service.cpp
++++ b/camera/provider/2.4/default/service.cpp
+@@ -25,6 +25,7 @@
+ #include <cutils/properties.h>
+ #include <hidl/LegacySupport.h>
+ #include <malloc.h>
++#include <signal.h>
+ 
+ using android::status_t;
+ using android::hardware::defaultLazyPassthroughServiceImplementation;
+@@ -40,6 +41,11 @@ const bool kLazyService = false;
+ int main()
+ {
+     ALOGI("CameraProvider@2.4 legacy service is starting.");
++    // A dumpsys reader that closes its end early (`dumpsys media.camera | grep -m1`)
++    // made the HAL's dump write() raise SIGPIPE and init restarted the whole
++    // provider, dropping every open camera (Meizu MX6, 2026-10-02 and 2026-10-06,
++    // "received signal 13"). With SIGPIPE ignored the write just fails with EPIPE.
++    signal(SIGPIPE, SIG_IGN);
+     // The camera HAL may communicate to other vendor components via
+     // /dev/vndbinder
+     android::ProcessState::initWithDriver("/dev/vndbinder");
